@@ -9,7 +9,8 @@ use anyhow::Result;
 
 // contracts
 pub enum AudioEvent {
-    Chunk { is_user: bool, data: Vec<f32> },
+    Chunk { is_user: bool, data: Vec<f32>, sample_rate: u32 },
+    Error(String),
 }
 
 pub enum TextEvent {
