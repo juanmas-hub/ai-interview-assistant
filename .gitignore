@@ -13,3 +13,6 @@ desktop.ini
 *.key
 
 /target
+
+test_sys.wav
+test_mic.wav

@@ -6,50 +6,52 @@ mod ui;
 
 use tokio::sync::mpsc;
 use anyhow::Result;
+use audio::wav_writer::DualWavWriter;
 
-// contracts
 pub enum AudioEvent {
-    Chunk { is_user: bool, data: Vec<f32>, sample_rate: u32 },
+    Chunk { is_user: bool, data: Vec<f32>, sample_rate: u32, channels: u16 },
     Error(String),
 }
 
-pub enum TextEvent {
+/*pub enum TextEvent {
     SttTranscription { speaker: String, text: String },
     LlmToken { token: String },
-}
+}*/
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    println!("AI Interview Copilot...");
+    println!("AI Interview Copilot");
 
-    // Channels
-    let channel_capacity: usize = 100;
-    let (audio_transmitter, audio_reciever) = mpsc::channel::<AudioEvent>(channel_capacity);
-    let (ui_transmitter, mut ui_reciever) = mpsc::channel::<TextEvent>(channel_capacity);
-    
-    let ui_transmitter_for_stt = ui_transmitter.clone();
-    let ui_transmitter_for_llm = ui_transmitter;
+    let (audio_transmitter, mut audio_reader) = mpsc::channel::<AudioEvent>(1000);
+    //let (ui_tx, ui_rx)           = mpsc::channel::<TextEvent>(100);
 
-    // Audio
-    std::thread::spawn(move || {
-        // src/audio/wasapi.rs
-        // y enviaremos los bytes por audio_tx
+    // Audio capture
+    audio::wasapi::start_concurrent_capture(audio_transmitter)?;
+
+    // WAV writer — for testing
+    tokio::spawn(async move {
+        let mut wav = DualWavWriter::new();
+
+        while let Some(event) = audio_reader.recv().await {
+            match event {
+                AudioEvent::Chunk { is_user, data, sample_rate, channels } =>
+                    wav.write_chunk(is_user, &data, sample_rate, channels),
+                AudioEvent::Error(e) =>
+                    eprintln!("[audio] Stream error: {}", e),
+            }
+        }
     });
 
     // STT
-    tokio::spawn(async move {
-        // Escucha audio_reciever, envía a Deepgram, y manda el texto por ui_transmitter_for_stt
-    });
+    // stt::
 
     // AI
-    tokio::spawn(async move {
-        // Lee transcripciones, consulta la DB Vectorial, llama al LLM,
-        // y manda los tokens de respuesta por ui_transmitter_for_llm
-    });
+    // ai::
 
     // UI Overlay
-    // ui::renderer::start_overlay(ui_reciever)?;
+    // ui::renderer::start_overlay(ui_r)?;
 
     tokio::signal::ctrl_c().await?;
+    println!("Cerrando...");
     Ok(())
 }
