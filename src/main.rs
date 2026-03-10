@@ -10,6 +10,7 @@ use audio::wav_writer::DualWavWriter;
 
 pub enum AudioEvent {
     Chunk { is_user: bool, data: Vec<f32>, sample_rate: u32, channels: u16 },
+    ResampledChunk { is_user: bool, data: Vec<i16> },
     Error(String),
 }
 
@@ -36,6 +37,9 @@ async fn main() -> Result<()> {
             match event {
                 AudioEvent::Chunk { is_user, data, sample_rate, channels } =>
                     wav.write_chunk(is_user, &data, sample_rate, channels),
+
+                AudioEvent::ResampledChunk { .. } => {}
+
                 AudioEvent::Error(e) =>
                     eprintln!("[audio] Stream error: {}", e),
             }

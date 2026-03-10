@@ -7,6 +7,7 @@ use ringbuf::{
     traits::{Producer, Consumer, Split},
 };
 use crate::AudioEvent;
+use crate::audio::resampler::Resampler;
 
 const RING_BUFFER_CAPACITY: usize = 48_000 * 2 * 4;
 
@@ -20,8 +21,8 @@ pub fn start_concurrent_capture(transmitter: mpsc::Sender<AudioEvent>) -> Result
 
 fn spawn_capture_thread(direction: wasapi::Direction, is_user: bool, transmitter: mpsc::Sender<AudioEvent>) {
 
-    let ring_buf = HeapRb::<f32>::new(RING_BUFFER_CAPACITY);
-    let (mut producer, consumer) = ring_buf.split();
+    let rb = HeapRb::<f32>::new(RING_BUFFER_CAPACITY);
+    let (mut producer, consumer) = rb.split();
 
     let (meta_tx, meta_rx) = std::sync::mpsc::channel::<(u32, u16)>();
 
@@ -78,18 +79,31 @@ fn consumer_loop(
     sample_rate: u32,
     channels: u16,
 ) -> Result<()> {
+    let mut resampler = Resampler::new(sample_rate as f64)?;
     let mut chunk = vec![0f32; CONSUMER_CHUNK_SIZE];
 
     loop {
         let read = consumer.pop_slice(&mut chunk);
 
         if read > 0 {
+            let samples = &chunk[..read];
+
             transmitter.blocking_send(AudioEvent::Chunk {
                 is_user,
-                data: chunk[..read].to_vec(),
+                data: samples.to_vec(),
                 sample_rate,
                 channels,
             }).map_err(|_| anyhow::anyhow!("[wasapi] Canal de audio cerrado"))?;
+
+            let mono    = Resampler::downmix_to_mono(samples, channels as usize);
+            let resampled = resampler.resample(&mono)?;
+
+            if !resampled.is_empty() {
+                transmitter.blocking_send(AudioEvent::ResampledChunk {
+                    is_user,
+                    data: resampled,
+                }).map_err(|_| anyhow::anyhow!("[wasapi] Canal de audio cerrado"))?;
+            }
         } else {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
