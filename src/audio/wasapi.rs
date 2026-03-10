@@ -2,127 +2,145 @@ use anyhow::Result;
 use tokio::sync::mpsc;
 use std::thread;
 use wasapi;
-use ringbuf::{
-    HeapRb,
-    traits::{Producer, Consumer, Split},
-};
-use crate::AudioEvent;
-use crate::audio::resampler::Resampler;
+use ringbuf::{HeapRb, traits::{Producer, Consumer, Split}};
 
-const RING_BUFFER_CAPACITY: usize = 48_000 * 2 * 4;
+use crate::config;
+use super::{AudioEvent, AudioFormat, Speaker};
+use super::resampler::Resampler;
 
-const CONSUMER_CHUNK_SIZE: usize = 4096;
+enum AudioSource {
+    Microphone,
+    SystemLoopback,
+}
 
-pub fn start_concurrent_capture(transmitter: mpsc::Sender<AudioEvent>) -> Result<()> {
-    spawn_capture_thread(wasapi::Direction::Capture, true,  transmitter.clone());
-    spawn_capture_thread(wasapi::Direction::Render,  false, transmitter);
+impl AudioSource {
+    fn wasapi_direction(&self) -> wasapi::Direction {
+        match self {
+            AudioSource::Microphone     => wasapi::Direction::Capture,
+            AudioSource::SystemLoopback => wasapi::Direction::Render,
+        }
+    }
+
+    fn speaker(&self) -> Speaker {
+        match self {
+            AudioSource::Microphone     => Speaker::User,
+            AudioSource::SystemLoopback => Speaker::System,
+        }
+    }
+}
+
+struct OpenDevice {
+    audio_client:   wasapi::AudioClient,
+    capture_client: wasapi::AudioCaptureClient,
+    event_handle:   wasapi::Handle,
+    format:         AudioFormat,
+}
+
+
+pub fn start_concurrent_capture(tx: mpsc::Sender<AudioEvent>) -> Result<()> {
+    spawn_capture_pipeline(AudioSource::Microphone,     tx.clone());
+    spawn_capture_pipeline(AudioSource::SystemLoopback, tx);
     Ok(())
 }
 
-fn spawn_capture_thread(direction: wasapi::Direction, is_user: bool, transmitter: mpsc::Sender<AudioEvent>) {
 
-    let rb = HeapRb::<f32>::new(RING_BUFFER_CAPACITY);
-    let (mut producer, consumer) = rb.split();
+fn spawn_capture_pipeline(source: AudioSource, tx: mpsc::Sender<AudioEvent>) {
+    let ring = HeapRb::<f32>::new(config::capture::RING_BUFFER_CAPACITY);
+    let (mut producer, consumer) = ring.split();
 
-    let (meta_tx, meta_rx) = std::sync::mpsc::channel::<(u32, u16)>();
+    let (format_tx, format_rx) = std::sync::mpsc::channel::<AudioFormat>();
+
+    let speaker   = source.speaker();
+    let direction = source.wasapi_direction();
 
     thread::spawn(move || {
         let _ = wasapi::initialize_mta();
-        let label = if is_user { "microphone" } else { "system" };
-
-        if let Err(e) = capture_loop(direction, is_user, &mut producer, meta_tx) {
-            eprintln!("[wasapi] Error in {} capture: {:?}", label, e);
+        if let Err(e) = fill_ring_buffer(direction, speaker, &mut producer, format_tx) {
+            eprintln!("[wasapi] {speaker} capture error: {e:?}");
         }
     });
 
     thread::spawn(move || {
-        let label = if is_user { "microphone" } else { "system" };
-
-        match meta_rx.recv() {
-            Ok((sample_rate, channels)) => {
-                if let Err(e) = consumer_loop(consumer, is_user, transmitter, sample_rate, channels) {
-                    eprintln!("[wasapi] Error in {} consumer: {:?}", label, e);
+        match format_rx.recv() {
+            Ok(format) => {
+                if let Err(e) = forward_normalized_audio(consumer, speaker, format, tx) {
+                    eprintln!("[wasapi] {speaker} forwarding error: {e:?}");
                 }
             }
-            Err(e) => eprintln!("[wasapi] Failed to receive {} metadata: {:?}", label, e),
+            Err(e) => eprintln!("[wasapi] {speaker} failed to receive format metadata: {e:?}"),
         }
     });
 }
 
-fn capture_loop(
+
+fn fill_ring_buffer(
     direction: wasapi::Direction,
-    is_user: bool,
-    producer: &mut impl Producer<Item = f32>,
-    meta_tx: std::sync::mpsc::Sender<(u32, u16)>,
+    speaker:   Speaker,
+    producer:  &mut impl Producer<Item = f32>,
+    format_tx: std::sync::mpsc::Sender<AudioFormat>,
 ) -> Result<()> {
-    let label = if is_user { "microphone" } else { "system" };
+    let device = open_device(&direction)?;
 
-    let (_audio_client, capture_client, event_handle, sample_rate, channels) =
-        setup_audio_client(&direction)?;
+    println!("[wasapi] {speaker} capture started — {}", device.format);
 
-    println!("[wasapi] Init {} capture — {}Hz, {} channels", label, sample_rate, channels);
+    format_tx.send(device.format)
+        .map_err(|_| anyhow::anyhow!("format channel closed before metadata was sent"))?;
 
-    meta_tx.send((sample_rate, channels as u16))
-        .map_err(|_| anyhow::anyhow!("[wasapi] Failed to send metadata to consumer"))?;
-
-    let timeout_ms = 1000;
     loop {
-        event_handle.wait_for_event(timeout_ms)?;
-        drain_capture_buffer(&capture_client, channels, producer)?;
+        device.event_handle.wait_for_event(config::capture::EVENT_TIMEOUT_MS)?;
+        drain_device_buffer(&device.capture_client, device.format.channels as usize, producer)?;
     }
 }
 
-fn consumer_loop(
+
+fn forward_normalized_audio(
     mut consumer: impl Consumer<Item = f32>,
-    is_user: bool,
-    transmitter: mpsc::Sender<AudioEvent>,
-    sample_rate: u32,
-    channels: u16,
+    speaker:      Speaker,
+    format:       AudioFormat,
+    tx:           mpsc::Sender<AudioEvent>,
 ) -> Result<()> {
-    let mut resampler = Resampler::new(sample_rate as f64)?;
-    let mut chunk = vec![0f32; CONSUMER_CHUNK_SIZE];
+    let mut resampler = Resampler::new(format.sample_rate as f64)?;
+    let mut chunk     = vec![0f32; config::capture::CONSUMER_CHUNK_SIZE];
 
     loop {
-        let read = consumer.pop_slice(&mut chunk);
+        let samples_read = consumer.pop_slice(&mut chunk);
 
-        if read > 0 {
-            let samples = &chunk[..read];
-
-            transmitter.blocking_send(AudioEvent::Chunk {
-                is_user,
-                data: samples.to_vec(),
-                sample_rate,
-                channels,
-            }).map_err(|_| anyhow::anyhow!("[wasapi] Canal de audio cerrado"))?;
-
-            let mono    = Resampler::downmix_to_mono(samples, channels as usize);
-            let resampled = resampler.resample(&mono)?;
-
-            if !resampled.is_empty() {
-                transmitter.blocking_send(AudioEvent::ResampledChunk {
-                    is_user,
-                    data: resampled,
-                }).map_err(|_| anyhow::anyhow!("[wasapi] Canal de audio cerrado"))?;
-            }
-        } else {
+        if samples_read == 0 {
             std::thread::sleep(std::time::Duration::from_millis(1));
+            continue;
+        }
+
+        let raw = &chunk[..samples_read];
+
+        tx.blocking_send(AudioEvent::RawCapture {
+            speaker,
+            samples: raw.to_vec(),
+            format,
+        }).map_err(|_| anyhow::anyhow!("audio channel closed"))?;
+
+        let mono      = Resampler::downmix_to_mono(raw, format.channels as usize);
+        let resampled = resampler.resample(&mono)?;
+
+        if !resampled.is_empty() {
+            tx.blocking_send(AudioEvent::NormalizedCapture {
+                speaker,
+                samples: resampled,
+            }).map_err(|_| anyhow::anyhow!("audio channel closed"))?;
         }
     }
 }
 
-fn setup_audio_client(
-    direction: &wasapi::Direction,
-) -> Result<(wasapi::AudioClient, wasapi::AudioCaptureClient, wasapi::Handle, u32, usize)> {
+fn open_device(direction: &wasapi::Direction) -> Result<OpenDevice> {
     let device = wasapi::DeviceEnumerator::new()?
         .get_default_device(direction)?;
 
     let mut audio_client = device.get_iaudioclient()?;
 
-    let mix_format   = audio_client.get_mixformat()?;
-    let sample_rate  = mix_format.get_samplespersec();
-    let channels     = mix_format.get_nchannels() as usize;
+    let mix_format  = audio_client.get_mixformat()?;
+    let sample_rate = mix_format.get_samplespersec();
+    let channels    = mix_format.get_nchannels() as usize;
 
-    let desired_format = wasapi::WaveFormat::new(
+    let float32_pcm = wasapi::WaveFormat::new(
         32, 32,
         &wasapi::SampleType::Float,
         sample_rate as usize,
@@ -132,47 +150,60 @@ fn setup_audio_client(
 
     let (default_period, _) = audio_client.get_device_period()?;
 
-    let stream_mode = wasapi::StreamMode::EventsShared {
-        autoconvert: true,
-        buffer_duration_hns: default_period,
+    let shared_event_mode = wasapi::StreamMode::EventsShared {
+        autoconvert:          true,
+        buffer_duration_hns:  default_period,
     };
 
-    audio_client.initialize_client(&desired_format, &wasapi::Direction::Capture, &stream_mode)?;
+    audio_client.initialize_client(
+        &float32_pcm,
+        &wasapi::Direction::Capture,
+        &shared_event_mode,
+    )?;
 
     let capture_client = audio_client.get_audiocaptureclient()?;
     let event_handle   = audio_client.set_get_eventhandle()?;
     audio_client.start_stream()?;
 
-    Ok((audio_client, capture_client, event_handle, sample_rate as u32, channels))
+    Ok(OpenDevice {
+        audio_client,
+        capture_client,
+        event_handle,
+        format: AudioFormat {
+            sample_rate: sample_rate as u32,
+            channels:    channels as u16,
+        },
+    })
 }
 
-fn drain_capture_buffer(
+fn drain_device_buffer(
     capture_client: &wasapi::AudioCaptureClient,
-    channels: usize,
-    producer: &mut impl Producer<Item = f32>,
+    channels:        usize,
+    producer:        &mut impl Producer<Item = f32>,
 ) -> Result<()> {
     loop {
-        let packet_size = capture_client.get_next_packet_size()?;
-        if packet_size.unwrap() == 0 { break; }
+        let packet_frames = capture_client.get_next_packet_size()?;
+        if packet_frames.unwrap() == 0 { break; }
 
-        let expected_bytes = packet_size.unwrap() as usize * channels * 4;
-        let mut raw = vec![0u8; expected_bytes];
-        capture_client.read_from_device(&mut raw)?;
+        let byte_count = packet_frames.unwrap() as usize * channels * std::mem::size_of::<f32>();
+        let mut raw_bytes = vec![0u8; byte_count];
+        capture_client.read_from_device(&mut raw_bytes)?;
 
-        if raw.is_empty() { break; }
+        if raw_bytes.is_empty() { break; }
 
-        let samples = bytes_to_f32_samples(&raw);
+        let samples = le_bytes_to_f32_samples(&raw_bytes);
+        let dropped = samples.len() - producer.push_slice(&samples);
 
-        let written = producer.push_slice(&samples);
-        if written < samples.len() {
-            eprintln!("[wasapi] Ring buffer overflow — {} samples dropped", samples.len() - written);
+        if dropped > 0 {
+            eprintln!("[wasapi] Ring buffer overflow — {dropped} samples dropped");
         }
     }
     Ok(())
 }
 
-fn bytes_to_f32_samples(raw: &[u8]) -> Vec<f32> {
-    raw.chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+fn le_bytes_to_f32_samples(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
         .collect()
 }

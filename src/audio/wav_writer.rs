@@ -1,52 +1,94 @@
 use hound::{WavSpec, WavWriter, SampleFormat};
 use std::io::BufWriter;
 use std::fs::File;
+use anyhow::Result;
 
-pub struct DualWavWriter {
-    mic_writer: Option<WavWriter<BufWriter<File>>>,
-    sys_writer: Option<WavWriter<BufWriter<File>>>,
+use crate::config;
+use super::{AudioFormat, Speaker};
+
+// ── Continuous raw capture recorder ──────────────────────────────────────────
+
+pub struct CaptureRecorder {
+    user_writer:   Option<WavWriter<BufWriter<File>>>,
+    system_writer: Option<WavWriter<BufWriter<File>>>,
 }
 
-impl DualWavWriter {
+impl CaptureRecorder {
     pub fn new() -> Self {
-        Self { mic_writer: None, sys_writer: None }
+        Self { user_writer: None, system_writer: None }
     }
 
-    pub fn write_chunk(&mut self, is_user: bool, samples: &[f32], sample_rate: u32, channels: u16) {
-        let writer = if is_user { &mut self.mic_writer } else { &mut self.sys_writer };
+    pub fn record_chunk(&mut self, speaker: Speaker, samples: &[f32], format: AudioFormat) {
+        let writer = match speaker {
+            Speaker::User   => &mut self.user_writer,
+            Speaker::System => &mut self.system_writer,
+        };
 
         if writer.is_none() {
-            *writer = Self::create_writer(is_user, sample_rate, channels);
+            *writer = open_wav_writer(speaker, format, SampleFormat::Float, 32);
         }
 
         if let Some(w) = writer {
             for &sample in samples {
                 if let Err(e) = w.write_sample(sample) {
-                    eprintln!("[wav] Error while writing sample: {:?}", e);
+                    eprintln!("[wav] Write error for {speaker}: {e:?}");
                     return;
                 }
             }
         }
     }
+}
 
-    fn create_writer(is_user: bool, sample_rate: u32, channels: u16) -> Option<WavWriter<BufWriter<File>>> {
-        let filename = if is_user { "test_mic.wav" } else { "test_sys.wav" };
-        let spec = WavSpec {
-            channels,
-            sample_rate,
-            bits_per_sample: 32,
-            sample_format: SampleFormat::Float,
-        };
+// ── Speech turn persistence ───────────────────────────────────────────────────
 
-        match WavWriter::create(filename, spec) {
-            Ok(w) => {
-                println!("[wav] '{}' created — {}Hz, {} channels", filename, sample_rate, channels);
-                Some(w)
-            }
-            Err(e) => {
-                eprintln!("[wav] Failed to create '{}': {:?}", filename, e);
-                None
-            }
+pub fn save_turn_as_wav(speaker: Speaker, start_ms: u128, samples: &[i16]) -> Result<()> {
+    let path = format!("turn_{}_{start_ms}.wav", speaker.label());
+
+    let spec = WavSpec {
+        channels:        1,
+        sample_rate:     config::resampler::TARGET_SAMPLE_RATE,
+        bits_per_sample: 16,
+        sample_format:   SampleFormat::Int,
+    };
+
+    let mut writer = WavWriter::create(&path, spec)?;
+    for &sample in samples {
+        writer.write_sample(sample)?;
+    }
+    writer.finalize()?;
+
+    println!("[wav] Turn saved → '{path}'");
+    Ok(())
+}
+
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+fn open_wav_writer(
+    speaker:       Speaker,
+    format:        AudioFormat,
+    sample_format: SampleFormat,
+    bits:          u16,
+) -> Option<WavWriter<BufWriter<File>>> {
+    let path = match speaker {
+        Speaker::User   => "raw_mic.wav",
+        Speaker::System => "raw_sys.wav",
+    };
+
+    let spec = WavSpec {
+        channels:        format.channels,
+        sample_rate:     format.sample_rate,
+        bits_per_sample: bits,
+        sample_format,
+    };
+
+    match WavWriter::create(path, spec) {
+        Ok(w) => {
+            println!("[wav] Recording {speaker} → '{path}' ({format})");
+            Some(w)
+        }
+        Err(e) => {
+            eprintln!("[wav] Failed to open '{path}': {e:?}");
+            None
         }
     }
 }

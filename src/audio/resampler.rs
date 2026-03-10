@@ -1,51 +1,44 @@
-use anyhow::{Result};
+use anyhow::Result;
 use rubato::{FftFixedIn, Resampler as RubatoResampler};
 
-const OUTPUT_SAMPLE_RATE: f64 = 16_000.0;
+use crate::config;
 
-const INPUT_CHUNK_FRAMES: usize = 1024;
-
-const SUB_CHUNKS: usize = 2;
-
-pub struct Resampler{
-    resampler: FftFixedIn<f32>,
-    input_buffer: Vec<Vec<f32>>,
+pub struct Resampler {
+    inner:         FftFixedIn<f32>,
+    input_buffer:  Vec<Vec<f32>>,
     output_buffer: Vec<Vec<f32>>,
 }
 
-impl Resampler{
-
+impl Resampler {
     pub fn new(input_sample_rate: f64) -> Result<Self> {
+        let target = config::resampler::TARGET_SAMPLE_RATE as f64;
 
-        println!(
-            "[resampler] Created: {}Hz -> {}Hz (rubato FftFixedIn)",
-            input_sample_rate, OUTPUT_SAMPLE_RATE
-        );
+        println!("[resampler] {input_sample_rate}Hz → {target}Hz");
 
-        let resampler = FftFixedIn::<f32>::new(
+        let inner = FftFixedIn::<f32>::new(
             input_sample_rate as usize,
-            OUTPUT_SAMPLE_RATE as usize,
-            INPUT_CHUNK_FRAMES,
-            SUB_CHUNKS,
+            target as usize,
+            config::resampler::INPUT_CHUNK_FRAMES,
+            config::resampler::SUB_CHUNKS,
             1,
         )
-        .map_err(|e| anyhow::anyhow!("[resampler] Failed to create FftFixedIn: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("failed to create resampler: {e}"))?;
 
         Ok(Self {
-            resampler,
+            inner,
             input_buffer:  vec![Vec::new()],
             output_buffer: vec![Vec::new()],
         })
     }
 
     pub fn downmix_to_mono(samples: &[f32], channels: usize) -> Vec<f32> {
-        if channels == 1 {
-            return samples.to_vec();
+        match channels {
+            1 => samples.to_vec(),
+            n => samples
+                .chunks_exact(n)
+                .map(|frame| frame.iter().sum::<f32>() / n as f32)
+                .collect(),
         }
-        samples
-            .chunks_exact(channels)
-            .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-            .collect()
     }
 
     pub fn resample(&mut self, mono_input: &[f32]) -> Result<Vec<i16>> {
@@ -54,33 +47,28 @@ impl Resampler{
         }
 
         self.input_buffer[0].extend_from_slice(mono_input);
+        let mut output: Vec<i16> = Vec::new();
 
-        let mut output_samples: Vec<i16> = Vec::new();
+        while self.input_buffer[0].len() >= self.inner.input_frames_next() {
+            let frames_needed = self.inner.input_frames_next();
+            let chunk: Vec<f32> = self.input_buffer[0].drain(..frames_needed).collect();
 
-        loop {
-            let frames_needed = self.resampler.input_frames_next();
-            if self.input_buffer[0].len() < frames_needed {
-                break;
-            }
+            let out_frames = self.inner.output_frames_next();
+            self.output_buffer[0].resize(out_frames, 0.0);
 
-            let chunk: Vec<f32> = self.input_buffer[0].drain(0..frames_needed).collect();
-            let input_chunk = vec![chunk];
-
-            let output_frames = self.resampler.output_frames_next();
-            self.output_buffer[0].resize(output_frames, 0.0);
-
-            match self.resampler.process_into_buffer(&input_chunk, &mut self.output_buffer, None) {
+            match self.inner.process_into_buffer(&[chunk], &mut self.output_buffer, None) {
                 Ok((_, out_len)) => {
-                    for &sample in &self.output_buffer[0][..out_len] {
-                        let scaled = (sample * 32_767.0).clamp(-32_768.0, 32_767.0);
-                        output_samples.push(scaled as i16);
-                    }
+                    output.extend(
+                        self.output_buffer[0][..out_len]
+                            .iter()
+                            .map(|&s| (s * 32_767.0).clamp(-32_768.0, 32_767.0) as i16),
+                    );
                 }
-                Err(e) => eprintln!("[resampler] Process error: {}", e),
+                Err(e) => eprintln!("[resampler] processing error: {e}"),
             }
         }
 
-        Ok(output_samples)
+        Ok(output)
     }
 }
 
