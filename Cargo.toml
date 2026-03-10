@@ -8,3 +8,6 @@ anyhow = "1.0.102"
 tokio = { version = "1.50.0", features = ["full"] }
 wasapi = "0.22"
 hound = "3.5"
+ringbuf = "0.4"
+rubato = "0.16"
+ort = { version = "2.0.0-rc.12", features = ["download-binaries"] }
