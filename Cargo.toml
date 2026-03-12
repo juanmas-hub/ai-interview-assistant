@@ -11,3 +11,7 @@ hound = "3.5"
 ringbuf = "0.4"
 rubato = "0.16"
 ort = { version = "2.0.0-rc.12", features = ["download-binaries"] }
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_UI_Input_KeyboardAndMouse",
+] }

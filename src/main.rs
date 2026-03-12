@@ -10,14 +10,18 @@ use anyhow::Result;
 use audio::{AudioEvent, Speaker};
 use audio::vad::{SpeechTurn, VadChannel};
 use audio::wav_writer::{CaptureRecorder, save_turn_as_wav};
+use audio::hotkey;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     println!("AI Interview Copilot starting…");
 
+    let pause_flag = hotkey::new_pause_flag();
+    hotkey::spawn_hotkey_listener(pause_flag.clone());  
+
     let (audio_tx, audio_rx) = mpsc::channel::<AudioEvent>(1_000);
 
-    audio::wasapi::start_concurrent_capture(audio_tx)?;
+    audio::wasapi::start_concurrent_capture(audio_tx, pause_flag)?;
 
     tokio::spawn(process_audio_stream(audio_rx));
 

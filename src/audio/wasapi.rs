@@ -3,7 +3,9 @@ use tokio::sync::mpsc;
 use std::thread;
 use wasapi;
 use ringbuf::{HeapRb, traits::{Producer, Consumer, Split}};
+use std::sync::atomic::Ordering;
 
+use crate::audio::hotkey::PauseFlag;
 use crate::config;
 use super::{AudioEvent, AudioFormat, Speaker};
 use super::resampler::Resampler;
@@ -37,14 +39,14 @@ struct OpenDevice {
 }
 
 
-pub fn start_concurrent_capture(tx: mpsc::Sender<AudioEvent>) -> Result<()> {
-    spawn_capture_pipeline(AudioSource::Microphone,     tx.clone());
-    spawn_capture_pipeline(AudioSource::SystemLoopback, tx);
+pub fn start_concurrent_capture(tx: mpsc::Sender<AudioEvent>, pause_flag: PauseFlag) -> Result<()> {
+    spawn_capture_pipeline(AudioSource::Microphone, tx.clone(), pause_flag.clone());
+    spawn_capture_pipeline(AudioSource::SystemLoopback, tx, pause_flag);
     Ok(())
 }
 
 
-fn spawn_capture_pipeline(source: AudioSource, tx: mpsc::Sender<AudioEvent>) {
+fn spawn_capture_pipeline(source: AudioSource, tx: mpsc::Sender<AudioEvent>, pause_flag: PauseFlag,) {
     let ring = HeapRb::<f32>::new(config::capture::RING_BUFFER_CAPACITY);
     let (mut ring_producer, ring_consumer) = ring.split();
     let speaker   = source.speaker();
@@ -62,7 +64,7 @@ fn spawn_capture_pipeline(source: AudioSource, tx: mpsc::Sender<AudioEvent>) {
 
     thread::spawn(move || {
         let _ = wasapi::initialize_mta();
-        if let Err(e) = forward_normalized_audio(ring_consumer, speaker, device.format, tx) {
+        if let Err(e) = forward_normalized_audio(ring_consumer, speaker, device.format, pause_flag, tx,) {
             eprintln!("[wasapi] {speaker} forwarding error: {e:?}");
         }
     });
@@ -89,6 +91,7 @@ fn forward_normalized_audio(
     mut consumer: impl Consumer<Item = f32>,
     speaker:      Speaker,
     format:       AudioFormat,
+    pause_flag:   PauseFlag,
     tx:           mpsc::Sender<AudioEvent>,
 ) -> Result<()> {
     let mut resampler = Resampler::new(format.sample_rate as f64)?;
@@ -99,6 +102,10 @@ fn forward_normalized_audio(
 
         if samples_read == 0 {
             std::thread::sleep(std::time::Duration::from_millis(1));
+            continue;
+        }
+
+        if pause_flag.load(Ordering::Relaxed) {
             continue;
         }
 
