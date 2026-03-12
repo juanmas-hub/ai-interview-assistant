@@ -1,5 +1,7 @@
 pub mod resampler;
 pub mod hotkey;
+pub mod normalizer;
+pub mod pipeline;
 pub mod vad;
 pub mod wasapi;
 pub mod wav_writer;
@@ -47,10 +49,6 @@ pub enum AudioEvent {
         speaker: Speaker,
         samples: Vec<f32>,
         format:  AudioFormat,
-    },
-    NormalizedCapture {
-        speaker: Speaker,
-        samples: Vec<i16>,
     },
     CaptureError {
         speaker: Speaker,
