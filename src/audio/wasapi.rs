@@ -3,12 +3,9 @@ use tokio::sync::mpsc;
 use std::thread;
 use wasapi;
 use ringbuf::{HeapRb, traits::{Producer, Consumer, Split}};
-use std::sync::atomic::Ordering;
 
-use crate::audio::hotkey::PauseFlag;
 use crate::config;
 use super::{AudioEvent, AudioFormat, Speaker};
-use super::resampler::Resampler;
 
 enum AudioSource {
     Microphone,
@@ -38,15 +35,19 @@ struct OpenDevice {
     format:         AudioFormat,
 }
 
+struct SendableDevice(OpenDevice);
+unsafe impl Send for SendableDevice {}
+unsafe impl Sync for SendableDevice {}
 
-pub fn start_concurrent_capture(tx: mpsc::Sender<AudioEvent>, pause_flag: PauseFlag) -> Result<()> {
-    spawn_capture_pipeline(AudioSource::Microphone, tx.clone(), pause_flag.clone());
-    spawn_capture_pipeline(AudioSource::SystemLoopback, tx, pause_flag);
+
+pub fn start_concurrent_capture(tx: mpsc::Sender<AudioEvent>) -> Result<()> {
+    spawn_capture_pipeline(AudioSource::Microphone, tx.clone());
+    spawn_capture_pipeline(AudioSource::SystemLoopback, tx);
     Ok(())
 }
 
 
-fn spawn_capture_pipeline(source: AudioSource, tx: mpsc::Sender<AudioEvent>, pause_flag: PauseFlag,) {
+fn spawn_capture_pipeline(source: AudioSource, tx: mpsc::Sender<AudioEvent>) {
     let ring = HeapRb::<f32>::new(config::capture::RING_BUFFER_CAPACITY);
     let (mut ring_producer, ring_consumer) = ring.split();
     let speaker   = source.speaker();
@@ -54,17 +55,19 @@ fn spawn_capture_pipeline(source: AudioSource, tx: mpsc::Sender<AudioEvent>, pau
 
     let _ = wasapi::initialize_mta();
     let device = open_device(&direction).expect("Open device error");
+    let format = device.format;
+    let sendable_device = SendableDevice(device);
 
     thread::spawn(move || {
         let _ = wasapi::initialize_mta();
-        if let Err(e) = fill_ring_buffer(direction, speaker, &mut ring_producer) {
+        if let Err(e) = fill_ring_buffer(sendable_device, speaker, &mut ring_producer) {
             eprintln!("[wasapi] {speaker} capture error: {e:?}");
         }
     });
 
     thread::spawn(move || {
         let _ = wasapi::initialize_mta();
-        if let Err(e) = forward_normalized_audio(ring_consumer, speaker, device.format, pause_flag, tx,) {
+        if let Err(e) = forward_raw_audio(ring_consumer, speaker, format, tx,) {
             eprintln!("[wasapi] {speaker} forwarding error: {e:?}");
         }
     });
@@ -72,60 +75,41 @@ fn spawn_capture_pipeline(source: AudioSource, tx: mpsc::Sender<AudioEvent>, pau
 
 
 fn fill_ring_buffer(
-    direction: wasapi::Direction,
+    device:   SendableDevice,
     speaker:   Speaker,
     producer:  &mut impl Producer<Item = f32>,
 ) -> Result<()> {
-    let device = open_device(&direction)?;
-
-    println!("[wasapi] {speaker} capture started — {}", device.format);
+    println!("[wasapi] {speaker} capture started — {}", device.0.format);
 
     loop {
-        device.event_handle.wait_for_event(config::capture::EVENT_TIMEOUT_MS)?;
-        drain_device_buffer(&device.capture_client, device.format.channels as usize, producer)?;
+        device.0.event_handle.wait_for_event(config::capture::EVENT_TIMEOUT_MS)?;
+        drain_device_buffer(&device.0.capture_client, device.0.format.channels as usize, producer)?;
     }
 }
 
 
-fn forward_normalized_audio(
+fn forward_raw_audio(
     mut consumer: impl Consumer<Item = f32>,
     speaker:      Speaker,
     format:       AudioFormat,
-    pause_flag:   PauseFlag,
     tx:           mpsc::Sender<AudioEvent>,
 ) -> Result<()> {
-    let mut resampler = Resampler::new(format.sample_rate as f64)?;
-    let mut chunk     = vec![0f32; config::capture::CONSUMER_CHUNK_SIZE];
+    let mut chunk = vec![0f32; config::capture::CONSUMER_CHUNK_SIZE];
 
     loop {
-        let samples_read = consumer.pop_slice(&mut chunk);
+        let n = consumer.pop_slice(&mut chunk);
 
-        if samples_read == 0 {
+        if n == 0 {
             std::thread::sleep(std::time::Duration::from_millis(1));
             continue;
         }
 
-        if pause_flag.load(Ordering::Relaxed) {
-            continue;
-        }
-
-        let raw = &chunk[..samples_read];
-
         tx.blocking_send(AudioEvent::RawCapture {
             speaker,
-            samples: raw.to_vec(),
+            samples: chunk[..n].to_vec(),
             format,
-        }).map_err(|_| anyhow::anyhow!("audio channel closed"))?;
-
-        let mono      = Resampler::downmix_to_mono(raw, format.channels as usize);
-        let resampled = resampler.resample(&mono)?;
-
-        if !resampled.is_empty() {
-            tx.blocking_send(AudioEvent::NormalizedCapture {
-                speaker,
-                samples: resampled,
-            }).map_err(|_| anyhow::anyhow!("audio channel closed"))?;
-        }
+        })
+        .map_err(|_| anyhow::anyhow!("audio channel closed"))?;
     }
 }
 
