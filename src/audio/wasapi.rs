@@ -46,28 +46,24 @@ pub fn start_concurrent_capture(tx: mpsc::Sender<AudioEvent>) -> Result<()> {
 
 fn spawn_capture_pipeline(source: AudioSource, tx: mpsc::Sender<AudioEvent>) {
     let ring = HeapRb::<f32>::new(config::capture::RING_BUFFER_CAPACITY);
-    let (mut producer, consumer) = ring.split();
-
-    let (format_tx, format_rx) = std::sync::mpsc::channel::<AudioFormat>();
-
+    let (mut ring_producer, ring_consumer) = ring.split();
     let speaker   = source.speaker();
     let direction = source.wasapi_direction();
 
+    let _ = wasapi::initialize_mta();
+    let device = open_device(&direction).expect("Open device error");
+
     thread::spawn(move || {
         let _ = wasapi::initialize_mta();
-        if let Err(e) = fill_ring_buffer(direction, speaker, &mut producer, format_tx) {
+        if let Err(e) = fill_ring_buffer(direction, speaker, &mut ring_producer) {
             eprintln!("[wasapi] {speaker} capture error: {e:?}");
         }
     });
 
     thread::spawn(move || {
-        match format_rx.recv() {
-            Ok(format) => {
-                if let Err(e) = forward_normalized_audio(consumer, speaker, format, tx) {
-                    eprintln!("[wasapi] {speaker} forwarding error: {e:?}");
-                }
-            }
-            Err(e) => eprintln!("[wasapi] {speaker} failed to receive format metadata: {e:?}"),
+        let _ = wasapi::initialize_mta();
+        if let Err(e) = forward_normalized_audio(ring_consumer, speaker, device.format, tx) {
+            eprintln!("[wasapi] {speaker} forwarding error: {e:?}");
         }
     });
 }
@@ -77,14 +73,10 @@ fn fill_ring_buffer(
     direction: wasapi::Direction,
     speaker:   Speaker,
     producer:  &mut impl Producer<Item = f32>,
-    format_tx: std::sync::mpsc::Sender<AudioFormat>,
 ) -> Result<()> {
     let device = open_device(&direction)?;
 
     println!("[wasapi] {speaker} capture started — {}", device.format);
-
-    format_tx.send(device.format)
-        .map_err(|_| anyhow::anyhow!("format channel closed before metadata was sent"))?;
 
     loop {
         device.event_handle.wait_for_event(config::capture::EVENT_TIMEOUT_MS)?;
