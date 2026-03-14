@@ -16,3 +16,16 @@ pub mod vad {
     pub const HANGOVER_CHUNKS:  usize = 20;
     pub const MIN_SPEECH_CHUNKS: usize = 3;
 }
+
+pub mod deepgram {
+    pub const WS_URL: &str = concat!(
+        "wss://api.deepgram.com/v1/listen",
+        "?model=nova-2",
+        "&language=es",
+        "&encoding=linear16",
+        "&sample_rate=16000",
+        "&channels=1",
+        "&interim_results=true",
+        "&endpointing=300",
+    );
+}

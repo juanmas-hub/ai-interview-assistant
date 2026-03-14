@@ -29,7 +29,7 @@ impl AudioSource {
 }
 
 struct OpenDevice {
-    audio_client:   wasapi::AudioClient,
+    // audio_client:   wasapi::AudioClient,
     capture_client: wasapi::AudioCaptureClient,
     event_handle:   wasapi::Handle,
     format:         AudioFormat,
@@ -149,7 +149,7 @@ fn open_device(direction: &wasapi::Direction) -> Result<OpenDevice> {
     audio_client.start_stream()?;
 
     Ok(OpenDevice {
-        audio_client,
+        // audio_client,
         capture_client,
         event_handle,
         format: AudioFormat {
