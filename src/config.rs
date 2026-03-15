@@ -1,7 +1,7 @@
 pub mod capture {
     pub const RING_BUFFER_CAPACITY: usize = 48_000 * 2 * 4;
     pub const CONSUMER_CHUNK_SIZE:  usize = 4_096;
-    pub const EVENT_TIMEOUT_MS:     u32   = 1_000;
+    pub const EVENT_TIMEOUT_MS:     u32   = 8 * 60 * 60 * 1_000; // 8 hour
 }
 
 pub mod resampler {
