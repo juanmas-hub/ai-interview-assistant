@@ -8,19 +8,41 @@ use crate::audio::vad::{SpeechTurn, VadChannel};
 use crate::audio::wav_writer::{CaptureRecorder, save_turn_as_wav};
 use crate::stt::SttSender;
 
-pub struct SttPair {
-    pub user:   Box<dyn SttSender>,
-    pub system: Box<dyn SttSender>,
+pub struct AudioProcessor {
+    normalizer: AudioNormalizer,
+    vad:        VadChannel,
+    stt:        Box<dyn SttSender>,
 }
 
-pub async fn run(mut rx: mpsc::Receiver<AudioEvent>, pause_flag: PauseFlag, stt: SttPair) {
-    let mut user_vad   = VadChannel::new(Speaker::User)
-        .expect("failed to initialise user VAD channel");
-    let mut system_vad = VadChannel::new(Speaker::System)
-        .expect("failed to initialise system VAD channel");
+impl AudioProcessor {
+    pub fn new(speaker: Speaker, stt: Box<dyn SttSender>) -> Self {
+        Self {
+            normalizer: AudioNormalizer::new(),
+            vad:        VadChannel::new(speaker).expect("failed to initialise VAD channel"),
+            stt,
+        }
+    }
 
-    let mut user_normalizer   = AudioNormalizer::new();
-    let mut system_normalizer = AudioNormalizer::new();
+    fn process(&mut self, samples: &[f32], format: AudioFormat) -> Vec<SpeechTurn> {
+        let normalized = match self.normalizer.process(samples, format) {
+            Ok(n) if !n.is_empty() => n,
+            Ok(_)  => return vec![],
+            Err(e) => { eprintln!("[normalizer] error: {e}"); return vec![]; }
+        };
+
+        self.stt.send(&normalized);
+        self.vad.push(&normalized)
+    }
+}
+
+pub async fn run(
+    mut rx:     mpsc::Receiver<AudioEvent>,
+    pause_flag: PauseFlag,
+    user_stt:   Box<dyn SttSender>,
+    system_stt: Box<dyn SttSender>,
+) {
+    let mut user   = AudioProcessor::new(Speaker::User,   user_stt);
+    let mut system = AudioProcessor::new(Speaker::System, system_stt);
 
     let mut recorder    = CaptureRecorder::new();
     let mut conversation: Vec<SpeechTurn> = Vec::new();
@@ -31,55 +53,21 @@ pub async fn run(mut rx: mpsc::Receiver<AudioEvent>, pause_flag: PauseFlag, stt:
         match event {
             AudioEvent::RawCapture { speaker, samples, format } => {
                 recorder.record_chunk(speaker, &samples, format);
-                on_raw_capture(
-                    speaker, &samples, format, &stt,
-                    &mut user_normalizer, &mut system_normalizer,
-                    &mut user_vad, &mut system_vad,
-                    &mut conversation,
-                );
+
+                let processor = match speaker {
+                    Speaker::User   => &mut user,
+                    Speaker::System => &mut system,
+                };
+
+                for turn in processor.process(&samples, format) {
+                    on_turn_completed(&turn);
+                    insert_chronologically(&mut conversation, turn);
+                }
             }
             AudioEvent::CaptureError { speaker, error } => {
                 eprintln!("[audio] {speaker} capture error: {error}");
             }
         }
-    }
-}
-
-fn on_raw_capture(
-    speaker:           Speaker,
-    samples:           &[f32],
-    format:            AudioFormat,
-    stt:               &SttPair,
-    user_normalizer:   &mut AudioNormalizer,
-    system_normalizer: &mut AudioNormalizer,
-    user_vad:          &mut VadChannel,
-    system_vad:        &mut VadChannel,
-    conversation:      &mut Vec<SpeechTurn>,
-) {
-    let normalizer = match speaker {
-        Speaker::User   => user_normalizer,
-        Speaker::System => system_normalizer,
-    };
-
-    let normalized = match normalizer.process(samples, format) {
-        Ok(n) if !n.is_empty() => n,
-        Ok(_)  => return,
-        Err(e) => { eprintln!("[normalizer] {speaker} error: {e}"); return; }
-    };
-
-    let stt_sender = match speaker {
-        Speaker::User   => &stt.user,
-        Speaker::System => &stt.system,
-    };
-    stt_sender.send(&normalized);
-
-    let new_turns = match speaker {
-        Speaker::User   => user_vad.push(&normalized),
-        Speaker::System => system_vad.push(&normalized),
-    };
-    for turn in new_turns {
-        on_turn_completed(&turn);
-        insert_chronologically(conversation, turn);
     }
 }
 
