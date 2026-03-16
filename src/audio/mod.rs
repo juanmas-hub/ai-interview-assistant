@@ -1,7 +1,6 @@
 pub mod resampler;
 pub mod hotkey;
 pub mod normalizer;
-pub mod pipeline;
 pub mod vad;
 pub mod wasapi;
 pub mod wav_writer;

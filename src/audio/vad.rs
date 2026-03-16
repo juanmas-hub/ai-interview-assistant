@@ -90,10 +90,6 @@ pub struct SpeechTurn {
 }
 
 impl SpeechTurn {
-    /*pub fn duration_ms(&self) -> u128 {
-        self.end_ms.saturating_sub(self.start_ms)
-    }*/
-
     pub fn duration_secs(&self) -> f32 {
         self.audio.len() as f32 / config::resampler::TARGET_SAMPLE_RATE as f32
     }
@@ -159,10 +155,6 @@ impl VadChannel {
 
         completed
     }
-
-    /*pub fn is_speaking(&self) -> bool {
-        matches!(self.state, TurnState::Speech { .. })
-    }*/
 
     fn advance_state(&mut self, is_speech: bool, chunk: &[i16], completed: &mut Vec<SpeechTurn>) {
         self.state = match (std::mem::replace(&mut self.state, TurnState::Silence), is_speech) {

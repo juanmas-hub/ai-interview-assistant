@@ -6,8 +6,6 @@ use anyhow::Result;
 use crate::config;
 use super::{AudioFormat, Speaker};
 
-// ── Continuous raw capture recorder ──────────────────────────────────────────
-
 pub struct CaptureRecorder {
     user_writer:   Option<WavWriter<BufWriter<File>>>,
     system_writer: Option<WavWriter<BufWriter<File>>>,
@@ -39,8 +37,6 @@ impl CaptureRecorder {
     }
 }
 
-// ── Speech turn persistence ───────────────────────────────────────────────────
-
 pub fn save_turn_as_wav(speaker: Speaker, start_ms: u128, samples: &[i16]) -> Result<()> {
     let path = format!("turn_{}_{start_ms}.wav", speaker.label());
 
@@ -61,7 +57,6 @@ pub fn save_turn_as_wav(speaker: Speaker, start_ms: u128, samples: &[i16]) -> Re
     Ok(())
 }
 
-// ── Internal helpers ──────────────────────────────────────────────────────────
 
 fn open_wav_writer(
     speaker:       Speaker,
