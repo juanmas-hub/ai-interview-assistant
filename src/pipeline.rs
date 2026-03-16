@@ -5,7 +5,7 @@ use crate::audio::{AudioEvent, AudioFormat, Speaker};
 use crate::audio::hotkey::PauseFlag;
 use crate::audio::normalizer::AudioNormalizer;
 use crate::audio::vad::{SpeechTurn, VadChannel};
-use crate::audio::wav_writer::{CaptureRecorder, save_turn_as_wav};
+//use crate::audio::wav_writer::{CaptureRecorder, save_turn_as_wav};
 use crate::stt::SttSender;
 
 pub struct AudioProcessor {
@@ -44,7 +44,7 @@ pub async fn run(
     let mut user   = AudioProcessor::new(Speaker::User,   user_stt);
     let mut system = AudioProcessor::new(Speaker::System, system_stt);
 
-    let mut recorder    = CaptureRecorder::new();
+    //let mut recorder    = CaptureRecorder::new();
     let mut conversation: Vec<SpeechTurn> = Vec::new();
 
     while let Some(event) = rx.recv().await {
@@ -52,7 +52,7 @@ pub async fn run(
 
         match event {
             AudioEvent::RawCapture { speaker, samples, format } => {
-                recorder.record_chunk(speaker, &samples, format);
+                //recorder.record_chunk(speaker, &samples, format);
 
                 let processor = match speaker {
                     Speaker::User   => &mut user,
@@ -74,9 +74,9 @@ pub async fn run(
 
 fn on_turn_completed(turn: &SpeechTurn) {
     println!("[TURN] {turn}");
-    if let Err(e) = save_turn_as_wav(turn.speaker, turn.start_ms, &turn.audio) {
+    /*if let Err(e) = save_turn_as_wav(turn.speaker, turn.start_ms, &turn.audio) {
         eprintln!("[wav] Failed to save turn: {e}");
-    }
+    }*/
 }
 
 fn insert_chronologically(conversation: &mut Vec<SpeechTurn>, turn: SpeechTurn) {
