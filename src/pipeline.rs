@@ -30,7 +30,8 @@ impl AudioProcessor {
             Err(e) => { eprintln!("[normalizer] error: {e}"); return vec![]; }
         };
 
-        self.vad.push(&normalized)
+        self.stt.send_audio(&normalized);  // fluye a Deepgram continuamente
+        self.vad.push(&normalized)         // VAD detecta cuándo termina el turno
     }
 }
 
@@ -59,7 +60,7 @@ pub async fn run(
                 };
 
                 for turn in processor.process(&samples, format) {
-                    processor.stt.send_turn(&turn);
+                    processor.stt.end_turn();  // VAD terminó — recogé el texto acumulado
                     on_turn_completed(&turn);
                     insert_chronologically(&mut conversation, turn);
                 }
