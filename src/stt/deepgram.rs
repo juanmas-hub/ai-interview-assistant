@@ -1,29 +1,19 @@
 use anyhow::Result;
-use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use tokio::net::TcpStream;
-use tokio::sync::mpsc;
-use tokio_tungstenite::{
-    connect_async,
-    MaybeTlsStream, WebSocketStream,
-    tungstenite::{client::IntoClientRequest, Message},
-};
-use futures_util::stream::{SplitSink, SplitStream};
 
 use crate::audio::Speaker;
 use crate::config;
-use super::{SttSender, TranscriptEvent};
-
-type WsSink   = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
-type WsStream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
+use super::SttSender;
+use crate::audio::vad::SpeechTurn;
 
 #[derive(Deserialize)]
 struct DgResponse {
-    #[serde(rename = "type")]
-    kind:         String,
-    // is_final:     Option<bool>,
-    speech_final: Option<bool>,
-    channel:      Option<DgChannel>,
+    results: DgResults,
+}
+
+#[derive(Deserialize)]
+struct DgResults {
+    channels: Vec<DgChannel>,
 }
 
 #[derive(Deserialize)]
@@ -37,80 +27,82 @@ struct DgAlternative {
 }
 
 pub struct DeepgramSender {
-    audio_tx: mpsc::UnboundedSender<Vec<u8>>,
+    api_key: String,
 }
 
 impl DeepgramSender {
-    pub async fn connect(
-        speaker:       Speaker,
-        transcript_tx: mpsc::Sender<TranscriptEvent>,
-        api_key:       &str,
-    ) -> Result<Self> {
-        let (sink, stream) = open_websocket(api_key).await?;
-        let (audio_tx, audio_rx) = mpsc::unbounded_channel();
-
-        tokio::spawn(sender_task(sink, audio_rx));
-        tokio::spawn(receiver_task(stream, speaker, transcript_tx));
-
-        println!("[deepgram] {speaker} connected");
-        Ok(Self { audio_tx })
+    pub fn new(api_key: &str) -> Self {
+        Self { api_key: api_key.to_string() }
     }
 }
 
 impl SttSender for DeepgramSender {
-    fn send(&self, samples: &[i16]) {
-        let bytes = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
-        let _ = self.audio_tx.send(bytes);
+    fn send_turn(&self, turn: &SpeechTurn) {
+        let api_key = self.api_key.clone();
+        let audio   = turn.audio.clone();
+        let speaker = turn.speaker;
+
+        tokio::spawn(async move {
+            match transcribe(&audio, &api_key).await {
+                Ok(text) if !text.trim().is_empty() => {
+                    let label = match speaker {
+                        Speaker::User   => "[User]",
+                        Speaker::System => "[Interviewer]",
+                    };
+                    println!("{label}: {}", text.trim());
+                }
+                Ok(_)    => {}
+                Err(e)   => eprintln!("[deepgram] {speaker} transcription error: {e}"),
+            }
+        });
     }
 }
 
+async fn transcribe(samples: &[i16], api_key: &str) -> Result<String> {
+    let chunks: Vec<&[i16]> = samples.chunks(config::deepgram::CHUNK_SAMPLES).collect();
 
-async fn sender_task(mut sink: WsSink, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
-    while let Some(bytes) = rx.recv().await {
-        if sink.send(Message::Binary(bytes)).await.is_err() {
-            break;
+    let client = reqwest::Client::new();
+    let mut handles = Vec::new();
+
+    for chunk in chunks {
+        let bytes: Vec<u8> = chunk.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let client  = client.clone();
+        let api_key = api_key.to_string();
+
+        handles.push(tokio::spawn(async move {
+            transcribe_chunk(&client, &bytes, &api_key).await
+        }));
+    }
+
+    let mut transcript = String::new();
+    for handle in handles {
+        let text = handle.await??;
+        if !transcript.is_empty() && !text.is_empty() {
+            transcript.push(' ');
         }
-    }
-}
-
-async fn receiver_task(
-    mut stream:    WsStream,
-    speaker:       Speaker,
-    transcript_tx: mpsc::Sender<TranscriptEvent>,
-) {
-    while let Some(Ok(msg)) = stream.next().await {
-        if let Some(event) = parse_message(msg, speaker) {
-            let _ = transcript_tx.send(event).await;
-        }
-    }
-    eprintln!("[deepgram] {speaker} stream closed");
-}
-
-async fn open_websocket(api_key: &str) -> Result<(WsSink, WsStream)> {
-    let mut request = config::deepgram::WS_URL.into_client_request()?;
-    request.headers_mut().insert(
-        "Authorization",
-        format!("Token {api_key}").parse()?,
-    );
-
-    let (ws, _) = connect_async(request).await?;
-    Ok(ws.split())
-}
-
-fn parse_message(msg: Message, speaker: Speaker) -> Option<TranscriptEvent> {
-    let text = msg.into_text().ok()?;
-    let resp: DgResponse = serde_json::from_str(&text).ok()?;
-
-    if resp.kind != "Results" {
-        return None;
+        transcript.push_str(&text);
     }
 
-    let transcript = resp.channel?.alternatives.into_iter().next()?.transcript;
+    Ok(transcript)
+}
 
-    Some(TranscriptEvent {
-        speaker,
-        text:         transcript,
-        // is_final:     resp.is_final.unwrap_or(false),
-        speech_final: resp.speech_final.unwrap_or(false),
-    })
+async fn transcribe_chunk(client: &reqwest::Client, bytes: &[u8], api_key: &str) -> Result<String> {
+    let response = client
+        .post(config::deepgram::REST_URL)
+        .header("Authorization", format!("Token {api_key}"))
+        .header("Content-Type", "application/octet-stream")
+        .body(bytes.to_vec())
+        .send()
+        .await?
+        .json::<DgResponse>()
+        .await?;
+
+    let text = response.results.channels
+        .into_iter()
+        .next()
+        .and_then(|c| c.alternatives.into_iter().next())
+        .map(|a| a.transcript)
+        .unwrap_or_default();
+
+    Ok(text)
 }

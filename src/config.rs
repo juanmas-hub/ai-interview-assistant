@@ -18,14 +18,13 @@ pub mod vad {
 }
 
 pub mod deepgram {
-    pub const WS_URL: &str = concat!(
-        "wss://api.deepgram.com/v1/listen",
+    pub const REST_URL: &str = concat!(
+        "https://api.deepgram.com/v1/listen",
         "?model=nova-2",
         "&language=es",
         "&encoding=linear16",
         "&sample_rate=16000",
         "&channels=1",
-        "&interim_results=true",
-        "&endpointing=300",
     );
+    pub const CHUNK_SAMPLES: usize = 16_000 * 5; // 5 segundos por chunk
 }

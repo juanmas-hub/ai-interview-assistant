@@ -30,7 +30,6 @@ impl AudioProcessor {
             Err(e) => { eprintln!("[normalizer] error: {e}"); return vec![]; }
         };
 
-        self.stt.send(&normalized);
         self.vad.push(&normalized)
     }
 }
@@ -60,6 +59,7 @@ pub async fn run(
                 };
 
                 for turn in processor.process(&samples, format) {
+                    processor.stt.send_turn(&turn);
                     on_turn_completed(&turn);
                     insert_chronologically(&mut conversation, turn);
                 }
