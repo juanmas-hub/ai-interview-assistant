@@ -13,8 +13,10 @@ pub trait SttSender: Send + Sync + 'static {
     fn send_audio(&self, samples: &[i16]);
     fn end_turn(&self);
 }
-
-pub async fn run(mut rx: mpsc::Receiver<TurnComplete>) {
+pub async fn run(
+    mut rx:  mpsc::Receiver<TurnComplete>,
+    forward: mpsc::Sender<TurnComplete>,
+) {
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -25,16 +27,20 @@ pub async fn run(mut rx: mpsc::Receiver<TurnComplete>) {
     while let Some(turn) = rx.recv().await {
         if turn.text.trim().is_empty() { continue; }
 
-        let label = match turn.speaker {
-            Speaker::User   => "[User]",
-            Speaker::System => "[Interviewer]",
-        };
-
-        let line = format!("{label}: {}\n", turn.text.trim());
+        let line = format!("{}: {}\n", label(&turn.speaker), turn.text.trim());
         print!("{line}");
 
         if let Err(e) = file.write_all(line.as_bytes()) {
             eprintln!("[transcript] write error: {e}");
         }
+
+        let _ = forward.send(turn).await;
+    }
+}
+
+fn label(speaker: &Speaker) -> &'static str {
+    match speaker {
+        Speaker::User   => "[User]",
+        Speaker::System => "[Interviewer]",
     }
 }

@@ -1,3 +1,5 @@
+use crate::audio::hotkey::{self, PauseFlag};
+
 pub mod capture {
     pub const RING_BUFFER_CAPACITY: usize = 48_000 * 2 * 4;
     pub const CONSUMER_CHUNK_SIZE:  usize = 4_096;
@@ -28,4 +30,23 @@ pub mod deepgram {
         "&interim_results=true",
         "&endpointing=300",
     );
+}
+
+pub struct Environment {
+    pub deepgram_api_key: String,
+    pub pause_flag:       PauseFlag,
+}
+
+impl Environment {
+    pub fn load() -> Self {
+        dotenvy::dotenv().ok();
+
+        let deepgram_api_key = std::env::var("DEEPGRAM_API_KEY")
+            .expect("DEEPGRAM_API_KEY env var not set");
+
+        let pause_flag = hotkey::new_pause_flag();
+        hotkey::spawn_hotkey_listener(pause_flag.clone());
+
+        Self { deepgram_api_key, pause_flag }
+    }
 }
