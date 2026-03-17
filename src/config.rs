@@ -32,6 +32,11 @@ pub mod deepgram {
     );
 }
 
+pub mod ai {
+    pub const EMBEDDING_DIMS: usize = 512;
+    pub const TOP_K:          usize = 3;
+}
+
 pub struct Environment {
     pub deepgram_api_key: String,
     pub pause_flag:       PauseFlag,

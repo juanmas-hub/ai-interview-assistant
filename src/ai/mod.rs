@@ -1,6 +1,7 @@
 pub mod rag;
 pub mod llm;
 pub mod embedder;
+pub mod vector_store;
 
 use anyhow::Result;
 
