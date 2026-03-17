@@ -15,7 +15,7 @@ pub mod resampler {
 pub mod vad {
     pub const CHUNK_SAMPLES:     usize = 512;
     pub const SPEECH_THRESHOLD:  f32   = 0.50;
-    pub const HANGOVER_CHUNKS:   usize = 20;
+    pub const HANGOVER_CHUNKS:   usize = 35;
     pub const MIN_SPEECH_CHUNKS: usize = 3;
 }
 
