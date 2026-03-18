@@ -8,29 +8,35 @@ const MODEL:   &str = "voyage-3-lite";
 
 static HTTP_CLIENT: LazyLock<Client> = LazyLock::new(Client::new);
 
-pub fn embed(text: &str) -> Result<Vec<f32>> {
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(embed_async(text))
-    })
+// ── Punto de entrada ──────────────────────────────────────────────────────────
+
+pub async fn embed(text: &str) -> Result<Vec<f32>> {
+    embed_batch(&[text])
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Voyage no devolvió ningún embedding"))
 }
 
-async fn embed_async(text: &str) -> Result<Vec<f32>> {
+pub async fn embed_batch(texts: &[&str]) -> Result<Vec<Vec<f32>>> {
     let api_key  = read_api_key()?;
-    let request  = build_request(text);
+    let request  = build_request(texts);
     let response = call_api(&api_key, &request).await?;
 
-    extract_vector(response)
+    extract_vectors(response)
 }
+
+// ── Pasos ─────────────────────────────────────────────────────────────────────
 
 fn read_api_key() -> Result<String> {
     std::env::var("VOYAGE_API_KEY")
         .map_err(|_| anyhow::anyhow!("VOYAGE_API_KEY env var not set"))
 }
 
-fn build_request(text: &str) -> Request {
+fn build_request(texts: &[&str]) -> Request {
     Request {
         model: MODEL,
-        input: text.to_string(),
+        input: texts.iter().map(|t| t.to_string()).collect(),
     }
 }
 
@@ -47,19 +53,18 @@ async fn call_api(api_key: &str, request: &Request) -> Result<Response> {
         .map_err(Into::into)
 }
 
-fn extract_vector(response: Response) -> Result<Vec<f32>> {
-    response
-        .data
-        .into_iter()
-        .next()
-        .map(|d| d.embedding)
-        .ok_or_else(|| anyhow::anyhow!("OpenAI no devolvió ningún embedding"))
+fn extract_vectors(response: Response) -> Result<Vec<Vec<f32>>> {
+    if response.data.is_empty() {
+        return Err(anyhow::anyhow!("Voyage no devolvió ningún embedding"));
+    }
+
+    Ok(response.data.into_iter().map(|d| d.embedding).collect())
 }
 
 #[derive(Serialize)]
 struct Request {
     model: &'static str,
-    input: String,
+    input: Vec<String>,
 }
 
 #[derive(Deserialize)]

@@ -10,6 +10,7 @@ use crate::audio::vad::{SpeechTurn, VadChannel};
 use crate::audio::wasapi::start_concurrent_capture;
 use crate::stt::{SttSender, TurnComplete};
 use crate::stt;
+use crate::ai::setup;
 
 pub async fn start(env: Environment) -> Result<()> {
     let (audio_tx,         audio_rx)        = mpsc::channel::<AudioEvent>(1_000);
@@ -22,6 +23,8 @@ pub async fn start(env: Environment) -> Result<()> {
     let system_stt: Box<dyn SttSender> = Box::new(
         DeepgramSender::connect(Speaker::System, turn_complete_tx,         &env.deepgram_api_key).await?
     );
+
+    let store = setup::load().await?;
 
     start_concurrent_capture(audio_tx)?;
 
