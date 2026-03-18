@@ -35,6 +35,7 @@ pub mod deepgram {
 pub mod ai {
     pub const EMBEDDING_DIMS: usize = 512;
     pub const TOP_K:          usize = 3;
+    pub const MIN_SCORE:      f32   = 0.40;
 }
 
 pub struct Environment {

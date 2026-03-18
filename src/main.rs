@@ -4,6 +4,7 @@ mod stt;
 mod pipeline;
 mod ai;
 mod ui;
+mod setup;
 
 use anyhow::Result;
 use config::Environment;

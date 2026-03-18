@@ -1,13 +1,14 @@
-pub mod rag;
-pub mod llm;
 pub mod embedder;
+mod llm;
+mod prompt;
+mod rag;
 pub mod vector_store;
-pub mod setup;
 
 use anyhow::Result;
+use std::sync::Arc;
+use vector_store::VectorStore;
 
-pub async fn run(question: &str) -> Result<String> {
-    let vec = embedder::embed(question).await?;
-    println!("[embedder] dims={} primer_valor={:.4}", vec.len(), vec[0]);
-    llm::complete(question).await
+pub async fn run(question: &str, store: &Arc<VectorStore>) -> Result<String> {
+    rag::answer(question, store).await
 }
+ 

@@ -3,18 +3,16 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
+use crate::ai::prompt::Prompt;
+
 const API_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
 const MODEL:   &str = "llama-3.1-8b-instant";
 
-const SYSTEM_PROMPT: &str =
-    "Sos un asistente experto ayudando a un candidato en una entrevista técnica. \
-     Respondé de forma clara, concisa y en español.";
-
 static HTTP_CLIENT: LazyLock<Client> = LazyLock::new(Client::new);
 
-pub async fn complete(question: &str) -> Result<String> {
+pub async fn complete(prompt: Prompt) -> Result<String> {
     let api_key  = read_api_key()?;
-    let request  = build_request(question);
+    let request  = build_request(prompt);
     let response = call_api(&api_key, &request).await?;
 
     extract_content(response)
@@ -25,12 +23,12 @@ fn read_api_key() -> Result<String> {
         .map_err(|_| anyhow::anyhow!("GROQ_API_KEY env var not set"))
 }
 
-fn build_request(question: &str) -> Request {
+fn build_request(prompt: Prompt) -> Request {
     Request {
         model:    MODEL,
         messages: vec![
-            Message { role: "system", content: SYSTEM_PROMPT.to_string() },
-            Message { role: "user",   content: question.to_string() },
+            Message { role: "system", content: prompt.system },
+            Message { role: "user",   content: prompt.user },
         ],
     }
 }
@@ -53,7 +51,7 @@ fn extract_content(response: Response) -> Result<String> {
         .choices
         .into_iter()
         .next()
-        .map(|choice| choice.message.content)
+        .map(|c| c.message.content)
         .ok_or_else(|| anyhow::anyhow!("Groq no devolvió ninguna respuesta"))
 }
 

@@ -1,39 +1,17 @@
-use tokio::sync::mpsc;
 use anyhow::Result;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use crate::config::Environment;
-use crate::stt::deepgram::DeepgramSender;
+use std::io::Write;
+use tokio::sync::mpsc;
+
 use crate::audio::{AudioEvent, AudioFormat, Speaker};
 use crate::audio::hotkey::PauseFlag;
 use crate::audio::normalizer::AudioNormalizer;
 use crate::audio::vad::{SpeechTurn, VadChannel};
-use crate::audio::wasapi::start_concurrent_capture;
 use crate::stt::{SttSender, TurnComplete};
-use crate::stt;
-use crate::ai::setup;
-
-pub async fn start(env: Environment) -> Result<()> {
-    let (audio_tx,         audio_rx)        = mpsc::channel::<AudioEvent>(1_000);
-    let (turn_complete_tx, turn_complete_rx) = mpsc::channel::<TurnComplete>(256);
-    let (ai_tx,            ai_rx)            = mpsc::channel::<TurnComplete>(256);
-
-    let user_stt:   Box<dyn SttSender> = Box::new(
-        DeepgramSender::connect(Speaker::User,   turn_complete_tx.clone(), &env.deepgram_api_key).await?
-    );
-    let system_stt: Box<dyn SttSender> = Box::new(
-        DeepgramSender::connect(Speaker::System, turn_complete_tx,         &env.deepgram_api_key).await?
-    );
-
-    let store = setup::load().await?;
-
-    start_concurrent_capture(audio_tx)?;
-
-    tokio::spawn(run(audio_rx, env.pause_flag, user_stt, system_stt));
-    tokio::spawn(run_ai(ai_rx));
-    tokio::spawn(stt::run(turn_complete_rx, ai_tx));
-
-    Ok(())
-}
+use crate::stt::deepgram::DeepgramSender;
+use crate::ai::vector_store::VectorStore;
+use crate::config::Environment;
 
 pub struct AudioProcessor {
     normalizer: AudioNormalizer,
@@ -60,6 +38,29 @@ impl AudioProcessor {
         self.stt.send_audio(&normalized);
         self.vad.push(&normalized)
     }
+}
+
+pub async fn start(env: Environment) -> Result<()> {
+    let store = Arc::new(crate::setup::load().await?);
+
+    let (audio_tx,         audio_rx)        = mpsc::channel::<AudioEvent>(1_000);
+    let (turn_complete_tx, turn_complete_rx) = mpsc::channel::<TurnComplete>(256);
+    let (ai_tx,            ai_rx)            = mpsc::channel::<TurnComplete>(256);
+
+    let user_stt:   Box<dyn SttSender> = Box::new(
+        DeepgramSender::connect(Speaker::User,   turn_complete_tx.clone(), &env.deepgram_api_key).await?
+    );
+    let system_stt: Box<dyn SttSender> = Box::new(
+        DeepgramSender::connect(Speaker::System, turn_complete_tx,         &env.deepgram_api_key).await?
+    );
+
+    crate::audio::wasapi::start_concurrent_capture(audio_tx)?;
+
+    tokio::spawn(run(audio_rx, env.pause_flag, user_stt, system_stt));
+    tokio::spawn(crate::stt::run(turn_complete_rx, ai_tx));
+    tokio::spawn(run_ai(ai_rx, store));
+
+    Ok(())
 }
 
 pub async fn run(
@@ -95,16 +96,31 @@ pub async fn run(
     }
 }
 
-pub async fn run_ai(mut rx: mpsc::Receiver<TurnComplete>) {
+pub async fn run_ai(mut rx: mpsc::Receiver<TurnComplete>, store: Arc<VectorStore>) {
     while let Some(turn) = rx.recv().await {
         if turn.speaker != Speaker::System { continue; }
 
+        let store = store.clone();
         tokio::spawn(async move {
-            match crate::ai::run(&turn.text).await {
-                Ok(response) => println!("[AI] {response}"),
+            match crate::ai::run(&turn.text, &store).await {
+                Ok(response) => write_ai_response(&response),
                 Err(e)       => eprintln!("[ai] error: {e}"),
             }
         });
+    }
+}
+
+fn write_ai_response(response: &str) {
+    println!("[AI] {response}");
+
+    let line   = format!("[AI]: {response}\n");
+    let result = std::fs::OpenOptions::new()
+        .append(true)
+        .open("transcript.txt")
+        .and_then(|mut f| f.write_all(line.as_bytes()));
+
+    if let Err(e) = result {
+        eprintln!("[ai] error writing to transcript: {e}");
     }
 }
 
