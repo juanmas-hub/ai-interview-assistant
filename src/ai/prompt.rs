@@ -15,11 +15,19 @@ pub fn build(context: &[SearchResult], question: &str) -> Prompt {
 fn build_system_prompt(context: &[SearchResult]) -> String {
     let context_block = format_context(context);
 
+    let context_section = if context_block.is_empty() {
+        String::new()
+    } else {
+        format!("Candidate background:\n{context_block}\n\n")
+    };
+
     format!(
-        "Sos un asistente experto ayudando a un candidato en una entrevista técnica backend.\n\
-         Respondé de forma clara y concisa en español.\n\
-         Basate ÚNICAMENTE en el siguiente contexto técnico para responder:\n\n\
-         {context_block}"
+        "You are an expert assistant helping a candidate during a backend technical interview.\n\
+         Give 2-3 concise bullet points the candidate can use to answer the question.\n\
+         If candidate background is provided, use it to personalize the answer.\n\
+         Always complement with your own technical knowledge to give a complete, smart response.\n\
+         Do NOT ask questions. Do NOT elaborate. Just key points to mention.\n\n\
+         {context_section}"
     )
 }
 

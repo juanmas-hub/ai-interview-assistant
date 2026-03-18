@@ -41,7 +41,8 @@ impl AudioProcessor {
 }
 
 pub async fn start(env: Environment) -> Result<()> {
-    let store = Arc::new(crate::setup::load().await?);
+    let context = crate::ui::prompt_user_context();
+    let store   = Arc::new(crate::setup::load(&context).await?);
 
     let (audio_tx,         audio_rx)        = mpsc::channel::<AudioEvent>(1_000);
     let (turn_complete_tx, turn_complete_rx) = mpsc::channel::<TurnComplete>(256);
@@ -63,6 +64,7 @@ pub async fn start(env: Environment) -> Result<()> {
     Ok(())
 }
 
+/// Captura y procesa audio en tiempo real.
 pub async fn run(
     mut rx:     mpsc::Receiver<AudioEvent>,
     pause_flag: PauseFlag,
@@ -96,6 +98,8 @@ pub async fn run(
     }
 }
 
+/// Recibe turnos del entrevistador, busca contexto en el store
+/// y responde via LLM.
 pub async fn run_ai(mut rx: mpsc::Receiver<TurnComplete>, store: Arc<VectorStore>) {
     while let Some(turn) = rx.recv().await {
         if turn.speaker != Speaker::System { continue; }
