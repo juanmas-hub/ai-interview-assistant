@@ -47,12 +47,17 @@ impl Environment {
     pub fn load() -> Self {
         dotenvy::dotenv().ok();
 
-        let deepgram_api_key = std::env::var("DEEPGRAM_API_KEY")
-            .expect("DEEPGRAM_API_KEY env var not set");
-
-        let pause_flag = hotkey::new_pause_flag();
-        hotkey::spawn_hotkey_listener(pause_flag.clone());
-
-        Self { deepgram_api_key, pause_flag }
+        Self {
+            deepgram_api_key: read_required_var("DEEPGRAM_API_KEY"),
+            pause_flag:       hotkey::new_pause_flag(),
+        }
     }
+
+    pub fn start_hotkey_listener(&self) {
+        hotkey::spawn_hotkey_listener(self.pause_flag.clone());
+    }
+}
+
+fn read_required_var(key: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| panic!("{key} env var not set"))
 }

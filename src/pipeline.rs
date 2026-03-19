@@ -10,17 +10,75 @@ use crate::audio::normalizer::AudioNormalizer;
 use crate::audio::vad::{SpeechTurn, VadChannel};
 use crate::stt::{SttSender, TurnComplete};
 use crate::stt::deepgram::DeepgramSender;
-use crate::ai::vector_store::VectorStore;
+use crate::ai::{AiServices, vector_store::VectorStore};
 use crate::config::Environment;
 
-pub struct AudioProcessor {
+struct Pipeline {
+    audio_rx:         mpsc::Receiver<AudioEvent>,
+    pause_flag:       PauseFlag,
+    user_stt:         Box<dyn SttSender>,
+    system_stt:       Box<dyn SttSender>,
+    turn_complete_rx: mpsc::Receiver<TurnComplete>,
+    ai_tx:            mpsc::Sender<TurnComplete>,
+    ai_rx:            mpsc::Receiver<TurnComplete>,
+    store:            Arc<VectorStore>,
+    services:         Arc<AiServices>,
+}
+
+struct AudioProcessor {
     normalizer: AudioNormalizer,
     vad:        VadChannel,
     stt:        Box<dyn SttSender>,
 }
 
+struct AudioRouter {
+    user:         AudioProcessor,
+    system:       AudioProcessor,
+    conversation: Vec<SpeechTurn>,
+}
+
+pub async fn start(env: Environment) -> Result<()> {
+    let pipeline = build(env).await?;
+    spawn(pipeline);
+    Ok(())
+}
+
+async fn build(env: Environment) -> Result<Pipeline> {
+    let services = Arc::new(AiServices::load()?);
+    let context  = crate::ui::prompt_user_context();
+    let store    = Arc::new(crate::setup::load(&context, &services).await?);
+
+    let (audio_tx,         audio_rx)         = mpsc::channel::<AudioEvent>(1_000);
+    let (turn_complete_tx, turn_complete_rx)  = mpsc::channel::<TurnComplete>(256);
+    let (ai_tx,            ai_rx)             = mpsc::channel::<TurnComplete>(256);
+
+    let user_stt   = connect_stt(Speaker::User,   turn_complete_tx.clone(), &env).await?;
+    let system_stt = connect_stt(Speaker::System, turn_complete_tx,         &env).await?;
+
+    crate::audio::wasapi::start_concurrent_capture(audio_tx)?;
+
+    Ok(Pipeline { audio_rx, pause_flag: env.pause_flag, user_stt, system_stt,
+                  turn_complete_rx, ai_tx, ai_rx, store, services })
+}
+
+fn spawn(p: Pipeline) {
+    tokio::spawn(run_audio(p.audio_rx, p.pause_flag, p.user_stt, p.system_stt));
+    tokio::spawn(crate::stt::run(p.turn_complete_rx, p.ai_tx));
+    tokio::spawn(run_ai(p.ai_rx, p.store, p.services));
+}
+
+async fn connect_stt(
+    speaker: Speaker,
+    tx:      mpsc::Sender<TurnComplete>,
+    env:     &Environment,
+) -> Result<Box<dyn SttSender>> {
+    Ok(Box::new(
+        DeepgramSender::connect(speaker, tx, &env.deepgram_api_key).await?
+    ))
+}
+
 impl AudioProcessor {
-    pub fn new(speaker: Speaker, stt: Box<dyn SttSender>) -> Self {
+    fn new(speaker: Speaker, stt: Box<dyn SttSender>) -> Self {
         Self {
             normalizer: AudioNormalizer::new(),
             vad:        VadChannel::new(speaker).expect("failed to initialise VAD channel"),
@@ -36,87 +94,101 @@ impl AudioProcessor {
         };
 
         self.stt.send_audio(&normalized);
-        self.vad.push(&normalized)
+        let turns = self.vad.push(&normalized);
+
+        for _ in &turns {
+            self.stt.end_turn();
+        }
+
+        turns
     }
 }
 
-pub async fn start(env: Environment) -> Result<()> {
-    let context = crate::ui::prompt_user_context();
-    let store   = Arc::new(crate::setup::load(&context).await?);
+impl AudioRouter {
+    fn new(user_stt: Box<dyn SttSender>, system_stt: Box<dyn SttSender>) -> Self {
+        Self {
+            user:         AudioProcessor::new(Speaker::User,   user_stt),
+            system:       AudioProcessor::new(Speaker::System, system_stt),
+            conversation: Vec::new(),
+        }
+    }
 
-    let (audio_tx,         audio_rx)        = mpsc::channel::<AudioEvent>(1_000);
-    let (turn_complete_tx, turn_complete_rx) = mpsc::channel::<TurnComplete>(256);
-    let (ai_tx,            ai_rx)            = mpsc::channel::<TurnComplete>(256);
-
-    let user_stt:   Box<dyn SttSender> = Box::new(
-        DeepgramSender::connect(Speaker::User,   turn_complete_tx.clone(), &env.deepgram_api_key).await?
-    );
-    let system_stt: Box<dyn SttSender> = Box::new(
-        DeepgramSender::connect(Speaker::System, turn_complete_tx,         &env.deepgram_api_key).await?
-    );
-
-    crate::audio::wasapi::start_concurrent_capture(audio_tx)?;
-
-    tokio::spawn(run(audio_rx, env.pause_flag, user_stt, system_stt));
-    tokio::spawn(crate::stt::run(turn_complete_rx, ai_tx));
-    tokio::spawn(run_ai(ai_rx, store));
-
-    Ok(())
-}
-
-/// Captura y procesa audio en tiempo real.
-pub async fn run(
-    mut rx:     mpsc::Receiver<AudioEvent>,
-    pause_flag: PauseFlag,
-    user_stt:   Box<dyn SttSender>,
-    system_stt: Box<dyn SttSender>,
-) {
-    let mut user   = AudioProcessor::new(Speaker::User,   user_stt);
-    let mut system = AudioProcessor::new(Speaker::System, system_stt);
-    let mut conversation: Vec<SpeechTurn> = Vec::new();
-
-    while let Some(event) = rx.recv().await {
-        if pause_flag.load(Ordering::Relaxed) { continue; }
-
+    fn handle(&mut self, event: AudioEvent) {
         match event {
             AudioEvent::RawCapture { speaker, samples, format } => {
-                let processor = match speaker {
-                    Speaker::User   => &mut user,
-                    Speaker::System => &mut system,
-                };
-
-                for turn in processor.process(&samples, format) {
-                    processor.stt.end_turn();
-                    on_turn_completed(&turn);
-                    insert_chronologically(&mut conversation, turn);
-                }
+                self.on_capture(speaker, &samples, format);
             }
             AudioEvent::CaptureError { speaker, error } => {
                 eprintln!("[audio] {speaker} capture error: {error}");
             }
         }
     }
-}
 
-/// Recibe turnos del entrevistador, busca contexto en el store
-/// y responde via LLM.
-pub async fn run_ai(mut rx: mpsc::Receiver<TurnComplete>, store: Arc<VectorStore>) {
-    while let Some(turn) = rx.recv().await {
-        if turn.speaker != Speaker::System { continue; }
+    fn on_capture(&mut self, speaker: Speaker, samples: &[f32], format: AudioFormat) {
+        for turn in self.processor(speaker).process(samples, format) {
+            log_speech_turn(&turn);
+            insert_chronologically(&mut self.conversation, turn);
+        }
+    }
 
-        let store = store.clone();
-        tokio::spawn(async move {
-            match crate::ai::run(&turn.text, &store).await {
-                Ok(response) => write_ai_response(&response),
-                Err(e)       => eprintln!("[ai] error: {e}"),
-            }
-        });
+    fn processor(&mut self, speaker: Speaker) -> &mut AudioProcessor {
+        match speaker {
+            Speaker::User   => &mut self.user,
+            Speaker::System => &mut self.system,
+        }
     }
 }
 
-fn write_ai_response(response: &str) {
-    println!("[AI] {response}");
+async fn run_audio(
+    mut rx:     mpsc::Receiver<AudioEvent>,
+    pause_flag: PauseFlag,
+    user_stt:   Box<dyn SttSender>,
+    system_stt: Box<dyn SttSender>,
+) {
+    let mut router = AudioRouter::new(user_stt, system_stt);
 
+    while let Some(event) = rx.recv().await {
+        if pause_flag.load(Ordering::Relaxed) { continue; }
+        router.handle(event);
+    }
+}
+
+async fn run_ai(
+    mut rx:   mpsc::Receiver<TurnComplete>,
+    store:    Arc<VectorStore>,
+    services: Arc<AiServices>,
+) {
+    while let Some(turn) = rx.recv().await {
+        if !is_interviewer_question(&turn) { continue; }
+        answer_in_background(turn, store.clone(), services.clone());
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn is_interviewer_question(turn: &TurnComplete) -> bool {
+    turn.speaker == Speaker::System
+}
+
+fn answer_in_background(turn: TurnComplete, store: Arc<VectorStore>, services: Arc<AiServices>) {
+    tokio::spawn(async move {
+        match crate::ai::answer(&turn.text, &store, &services).await {
+            Ok(response) => output_ai_response(&response),
+            Err(e)       => eprintln!("[ai] error: {e}"),
+        }
+    });
+}
+
+fn output_ai_response(response: &str) {
+    print_response(response);
+    append_to_transcript(response);
+}
+
+fn print_response(response: &str) {
+    println!("[AI] {response}");
+}
+
+fn append_to_transcript(response: &str) {
     let line   = format!("[AI]: {response}\n");
     let result = std::fs::OpenOptions::new()
         .append(true)
@@ -128,7 +200,7 @@ fn write_ai_response(response: &str) {
     }
 }
 
-fn on_turn_completed(turn: &SpeechTurn) {
+fn log_speech_turn(turn: &SpeechTurn) {
     println!("[TURN] {turn}");
 }
 

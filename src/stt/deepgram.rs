@@ -17,24 +17,6 @@ use super::{SttSender, TurnComplete};
 type WsSink   = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 type WsStream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 
-#[derive(Deserialize)]
-struct DgResponse {
-    #[serde(rename = "type")]
-    kind:     String,
-    is_final: Option<bool>,
-    channel:  Option<DgChannel>,
-}
-
-#[derive(Deserialize)]
-struct DgChannel {
-    alternatives: Vec<DgAlternative>,
-}
-
-#[derive(Deserialize)]
-struct DgAlternative {
-    transcript: String,
-}
-
 pub struct DeepgramSender {
     audio_tx:    mpsc::UnboundedSender<Vec<u8>>,
     end_turn_tx: mpsc::UnboundedSender<()>,
@@ -49,13 +31,10 @@ impl DeepgramSender {
         let (audio_tx,    audio_rx)    = mpsc::unbounded_channel::<Vec<u8>>();
         let (end_turn_tx, end_turn_rx) = mpsc::unbounded_channel::<()>();
 
-        tokio::spawn(connection_supervisor(
-            speaker,
-            audio_rx,
-            end_turn_rx,
-            turn_complete_tx,
-            api_key.to_string(),
-        ));
+        tokio::spawn(
+            DeepgramConnection::new(speaker, api_key.to_string(), turn_complete_tx)
+                .supervise(audio_rx, end_turn_rx)
+        );
 
         println!("[deepgram] {speaker} connected");
         Ok(Self { audio_tx, end_turn_tx })
@@ -73,97 +52,153 @@ impl SttSender for DeepgramSender {
     }
 }
 
-async fn connection_supervisor(
+struct DeepgramConnection {
     speaker:          Speaker,
-    mut audio_rx:     mpsc::UnboundedReceiver<Vec<u8>>,
-    mut end_turn_rx:  mpsc::UnboundedReceiver<()>,
-    turn_complete_tx: mpsc::Sender<TurnComplete>,
     api_key:          String,
-) {
-    let mut accumulated = String::new();
+    turn_complete_tx: mpsc::Sender<TurnComplete>,
+    accumulated:      String,
+}
 
-    loop {
-        let (sink, stream) = match open_websocket(&api_key).await {
-            Ok(ws) => ws,
-            Err(e) => {
-                eprintln!("[deepgram] {speaker} reconnect failed: {e}, retrying in 2s…");
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                continue;
+impl DeepgramConnection {
+    fn new(speaker: Speaker, api_key: String, turn_complete_tx: mpsc::Sender<TurnComplete>) -> Self {
+        Self { speaker, api_key, turn_complete_tx, accumulated: String::new() }
+    }
+
+    async fn supervise(
+        mut self,
+        mut audio_rx:    mpsc::UnboundedReceiver<Vec<u8>>,
+        mut end_turn_rx: mpsc::UnboundedReceiver<()>,
+    ) {
+        loop {
+            match self.open_session().await {
+                Ok(session) => {
+                    let outcome = session.run(
+                        self.speaker,
+                        &mut audio_rx,
+                        &mut end_turn_rx,
+                        &self.turn_complete_tx,
+                        &mut self.accumulated,
+                    ).await;
+
+                    match outcome {
+                        SessionOutcome::Done         => break,
+                        SessionOutcome::StreamClosed => {
+                            eprintln!("[deepgram] {} stream closed, reconnecting…", self.speaker);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[deepgram] {} reconnect failed: {e}, retrying in 2s…", self.speaker);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                }
             }
-        };
+        }
+    }
 
-        println!("[deepgram] {speaker} connected");
+    async fn open_session(&self) -> Result<DeepgramSession> {
+        let (sink, stream) = open_websocket(&self.api_key).await?;
+        println!("[deepgram] {} connected", self.speaker);
 
         let (ws_tx, ws_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         tokio::spawn(sender_task(sink, ws_rx));
 
-        let closed = run_session(
-            stream,
-            speaker,
-            &mut audio_rx,
-            &mut end_turn_rx,
-            &ws_tx,
-            &turn_complete_tx,
-            &mut accumulated,
-        ).await;
+        Ok(DeepgramSession { stream, ws_tx })
+    }
+}
 
-        if closed {
-            eprintln!("[deepgram] {speaker} stream closed, reconnecting…");
-        } else {
-            break;
+struct DeepgramSession {
+    stream: WsStream,
+    ws_tx:  mpsc::UnboundedSender<Vec<u8>>,
+}
+
+enum SessionOutcome {
+    StreamClosed,
+    Done,
+}
+
+impl DeepgramSession {
+    async fn run(
+        mut self,
+        speaker:          Speaker,
+        audio_rx:         &mut mpsc::UnboundedReceiver<Vec<u8>>,
+        end_turn_rx:      &mut mpsc::UnboundedReceiver<()>,
+        turn_complete_tx: &mpsc::Sender<TurnComplete>,
+        accumulated:      &mut String,
+    ) -> SessionOutcome {
+        loop {
+            tokio::select! {
+                msg = self.stream.next() => {
+                    if !self.on_ws_message(msg, accumulated, speaker) {
+                        return SessionOutcome::StreamClosed;
+                    }
+                }
+                audio = audio_rx.recv() => {
+                    if !self.on_audio(audio) { return SessionOutcome::Done; }
+                }
+                end = end_turn_rx.recv() => {
+                    if !self.on_end_turn(end, speaker, accumulated, turn_complete_tx).await {
+                        return SessionOutcome::Done;
+                    }
+                }
+            }
+        }
+    }
+
+    fn on_ws_message(
+        &self,
+        msg:         Option<Result<Message, tokio_tungstenite::tungstenite::Error>>,
+        accumulated: &mut String,
+        speaker:     Speaker,
+    ) -> bool {
+        let msg = match msg {
+            Some(Ok(m)) => m,
+            _           => return false,
+        };
+
+        if let Some(fragment) = parse_is_final(msg) {
+            accumulate(accumulated, &fragment, speaker);
+        }
+
+        true
+    }
+
+    fn on_audio(&self, audio: Option<Vec<u8>>) -> bool {
+        match audio {
+            Some(bytes) => { let _ = self.ws_tx.send(bytes); true }
+            None        => false,
+        }
+    }
+
+    async fn on_end_turn(
+        &self,
+        end:              Option<()>,
+        speaker:          Speaker,
+        accumulated:      &mut String,
+        turn_complete_tx: &mpsc::Sender<TurnComplete>,
+    ) -> bool {
+        match end {
+            Some(_) => {
+                let text = std::mem::take(accumulated);
+                let _ = turn_complete_tx.send(TurnComplete { speaker, text }).await;
+                true
+            }
+            None => false,
         }
     }
 }
 
-async fn run_session(
-    mut stream:       WsStream,
-    speaker:          Speaker,
-    audio_rx:         &mut mpsc::UnboundedReceiver<Vec<u8>>,
-    end_turn_rx:      &mut mpsc::UnboundedReceiver<()>,
-    ws_tx:            &mpsc::UnboundedSender<Vec<u8>>,
-    turn_complete_tx: &mpsc::Sender<TurnComplete>,
-    accumulated:      &mut String,
-) -> bool {
-    loop {
-        tokio::select! {
-            msg = stream.next() => {
-                match msg {
-                    Some(Ok(msg)) => {
-                        if let Some(fragment) = parse_is_final(msg) {
-                            if !fragment.is_empty() {
-                                if !accumulated.is_empty() { accumulated.push(' '); }
-                                accumulated.push_str(&fragment);
-                                println!("[fragment] {speaker}: {fragment}");
-                            }
-                        }
-                    }
-                    _ => return true,
-                }
-            }
-            audio = audio_rx.recv() => {
-                match audio {
-                    Some(bytes) => { let _ = ws_tx.send(bytes); }
-                    None        => return false,
-                }
-            }
-            end = end_turn_rx.recv() => {
-                match end {
-                    Some(_) => {
-                        let text = std::mem::take(accumulated);
-                        let _ = turn_complete_tx.send(TurnComplete { speaker, text }).await;
-                    }
-                    None => return false,
-                }
-            }
-        }
-    }
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn accumulate(accumulated: &mut String, fragment: &str, speaker: Speaker) {
+    if fragment.is_empty() { return; }
+    if !accumulated.is_empty() { accumulated.push(' '); }
+    accumulated.push_str(fragment);
+    println!("[fragment] {speaker}: {fragment}");
 }
 
 async fn sender_task(mut sink: WsSink, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
     while let Some(bytes) = rx.recv().await {
-        if sink.send(Message::Binary(bytes)).await.is_err() {
-            break;
-        }
+        if sink.send(Message::Binary(bytes)).await.is_err() { break; }
     }
 }
 
@@ -181,12 +216,30 @@ fn parse_is_final(msg: Message) -> Option<String> {
     let text = msg.into_text().ok()?;
     let resp: DgResponse = serde_json::from_str(&text).ok()?;
 
-    if resp.kind != "Results" { return None; }
-    if !resp.is_final.unwrap_or(false) { return None; }
+    if resp.kind != "Results"            { return None; }
+    if !resp.is_final.unwrap_or(false)   { return None; }
 
     resp.channel?
         .alternatives
         .into_iter()
         .next()
         .map(|a| a.transcript)
+}
+
+#[derive(Deserialize)]
+struct DgResponse {
+    #[serde(rename = "type")]
+    kind:     String,
+    is_final: Option<bool>,
+    channel:  Option<DgChannel>,
+}
+
+#[derive(Deserialize)]
+struct DgChannel {
+    alternatives: Vec<DgAlternative>,
+}
+
+#[derive(Deserialize)]
+struct DgAlternative {
+    transcript: String,
 }

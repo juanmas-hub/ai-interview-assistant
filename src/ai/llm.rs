@@ -1,21 +1,38 @@
 use anyhow::Result;
+use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
-use crate::ai::prompt::Prompt;
+use super::prompt::Prompt;
+
+#[async_trait]
+pub trait Llm: Send + Sync {
+    async fn complete(&self, prompt: Prompt) -> Result<String>;
+}
 
 const API_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
 const MODEL:   &str = "llama-3.1-8b-instant";
 
 static HTTP_CLIENT: LazyLock<Client> = LazyLock::new(Client::new);
 
-pub async fn complete(prompt: Prompt) -> Result<String> {
-    let api_key  = read_api_key()?;
-    let request  = build_request(prompt);
-    let response = call_api(&api_key, &request).await?;
+pub struct GroqLlm {
+    api_key: String,
+}
 
-    extract_content(response)
+impl GroqLlm {
+    pub fn new() -> Result<Self> {
+        Ok(Self { api_key: read_api_key()? })
+    }
+}
+
+#[async_trait]
+impl Llm for GroqLlm {
+    async fn complete(&self, prompt: Prompt) -> Result<String> {
+        let request: Request  = build_request(prompt);
+        let response: Response = call_api(&self.api_key, &request).await?;
+        extract_content(response)
+    }
 }
 
 fn read_api_key() -> Result<String> {
