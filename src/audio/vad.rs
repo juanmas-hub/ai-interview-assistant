@@ -9,6 +9,19 @@ use ort::{
 use crate::config;
 use super::Speaker;
 
+// ── Trait ─────────────────────────────────────────────────────────────────────
+
+/// Abstracción sobre cualquier detector de actividad de voz.
+/// Separa la inferencia ML de la máquina de estados del turno.
+pub trait VoiceDetector: Send {
+    /// Devuelve true si el chunk de audio contiene voz.
+    fn is_speech(&mut self, chunk: &[f32]) -> bool;
+    /// Reinicia el estado interno del modelo entre turnos.
+    fn reset(&mut self);
+}
+
+// ── SileroVad ─────────────────────────────────────────────────────────────────
+
 const MODEL_BYTES: &[u8] = include_bytes!("silero_vad.onnx");
 
 static SHARED_SESSION: LazyLock<Arc<Mutex<Session>>> = LazyLock::new(|| {
@@ -75,11 +88,19 @@ impl SileroVad {
 
         outputs["output"].try_extract_tensor::<f32>().unwrap().1[0]
     }
+}
 
-    fn reset_state(&mut self) {
+impl VoiceDetector for SileroVad {
+    fn is_speech(&mut self, chunk: &[f32]) -> bool {
+        self.speech_probability(chunk) >= config::vad::SPEECH_THRESHOLD
+    }
+
+    fn reset(&mut self) {
         self.state.fill(0.0);
     }
 }
+
+// ── SpeechTurn ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct SpeechTurn {
@@ -109,6 +130,8 @@ impl fmt::Display for SpeechTurn {
     }
 }
 
+// ── TurnState ─────────────────────────────────────────────────────────────────
+
 enum TurnState {
     Silence,
     Speech {
@@ -119,8 +142,12 @@ enum TurnState {
     },
 }
 
+// ── VadChannel ────────────────────────────────────────────────────────────────
+
+/// Máquina de estados que detecta y delimita turnos de voz.
+/// Delega la inferencia acústica al VoiceDetector inyectado.
 pub struct VadChannel {
-    vad:        SileroVad,
+    vad:        Box<dyn VoiceDetector>,
     speaker:    Speaker,
     sample_buf: Vec<i16>,
     state:      TurnState,
@@ -134,93 +161,150 @@ impl VadChannel {
             config::vad::SPEECH_THRESHOLD,
         );
         Ok(Self {
-            vad:        SileroVad::new(),
+            vad:        Box::new(SileroVad::new()),
             speaker,
             sample_buf: Vec::new(),
             state:      TurnState::Silence,
         })
     }
 
+    /// Ingresa muestras, detecta voz chunk a chunk y devuelve los turnos completados.
     pub fn push(&mut self, samples: &[i16]) -> Vec<SpeechTurn> {
         self.sample_buf.extend_from_slice(samples);
         let mut completed = Vec::new();
 
         while self.sample_buf.len() >= config::vad::CHUNK_SAMPLES {
-            let chunk: Vec<i16> = self.sample_buf.drain(..config::vad::CHUNK_SAMPLES).collect();
-            let f32_chunk: Vec<f32> = chunk.iter().map(|&s| s as f32 / 32_768.0).collect();
-
-            let is_speech = self.vad.speech_probability(&f32_chunk) >= config::vad::SPEECH_THRESHOLD;
+            let chunk = self.drain_next_chunk();
+            let f32_chunk = i16_chunk_to_f32(&chunk);
+            let is_speech = self.vad.is_speech(&f32_chunk);
             self.advance_state(is_speech, &chunk, &mut completed);
         }
 
         completed
     }
 
+    // ── Máquina de estados ────────────────────────────────────────────────────
+
     fn advance_state(&mut self, is_speech: bool, chunk: &[i16], completed: &mut Vec<SpeechTurn>) {
-        self.state = match (std::mem::replace(&mut self.state, TurnState::Silence), is_speech) {
-
-            (TurnState::Silence, true) => {
-                println!("[VAD] {speaker} ▶ speech started", speaker = self.speaker);
-                TurnState::Speech {
-                    chunk_count:   1,
-                    audio:         chunk.to_vec(),
-                    start_ms:      now_ms(),
-                    hangover_left: config::vad::HANGOVER_CHUNKS,
-                }
-            }
-
-            (TurnState::Speech { chunk_count, mut audio, start_ms, .. }, true) => {
-                audio.extend_from_slice(chunk);
-                TurnState::Speech {
-                    chunk_count:   chunk_count + 1,
-                    audio,
-                    start_ms,
-                    hangover_left: config::vad::HANGOVER_CHUNKS,
-                }
-            }
-
-            (TurnState::Speech { chunk_count, mut audio, start_ms, hangover_left }, false)
-                if hangover_left > 1 =>
-            {
-                audio.extend_from_slice(chunk);
-                TurnState::Speech {
-                    chunk_count,
-                    audio,
-                    start_ms,
-                    hangover_left: hangover_left - 1,
-                }
-            }
-
-            (TurnState::Speech { chunk_count, mut audio, start_ms, .. }, false) => {
-                audio.extend_from_slice(chunk);
-                let end_ms = now_ms();
-
-                if chunk_count >= config::vad::MIN_SPEECH_CHUNKS {
-                    println!(
-                        "[VAD] {speaker} ■ turn ended ({chunk_count} chunks, {}ms)",
-                        end_ms.saturating_sub(start_ms),
-                        speaker = self.speaker,
-                    );
-                    completed.push(SpeechTurn {
-                        speaker: self.speaker,
-                        audio,
-                        start_ms,
-                        end_ms,
-                    });
-                } else {
-                    println!(
-                        "[VAD] {speaker} ✗ noise burst discarded ({chunk_count} chunks)",
-                        speaker = self.speaker,
-                    );
-                }
-
-                self.vad.reset_state();
-                TurnState::Silence
-            }
-
-            (TurnState::Silence, false) => TurnState::Silence,
-        };
+        // Reemplazamos self.state antes de llamar métodos que necesitan &mut self.
+        let old_state = std::mem::replace(&mut self.state, TurnState::Silence);
+        self.state = self.transition(old_state, is_speech, chunk, completed);
     }
+
+    fn transition(
+        &mut self,
+        state:     TurnState,
+        is_speech: bool,
+        chunk:     &[i16],
+        completed: &mut Vec<SpeechTurn>,
+    ) -> TurnState {
+        match (state, is_speech) {
+            (TurnState::Silence, true) =>
+                self.on_speech_started(chunk),
+
+            (TurnState::Silence, false) =>
+                TurnState::Silence,
+
+            (TurnState::Speech { chunk_count, audio, start_ms, .. }, true) =>
+                speech_continued(chunk_count, audio, start_ms, chunk),
+
+            (TurnState::Speech { chunk_count, audio, start_ms, hangover_left }, false)
+                if hangover_left > 1 =>
+                speech_in_hangover(chunk_count, audio, start_ms, hangover_left, chunk),
+
+            (TurnState::Speech { chunk_count, audio, start_ms, .. }, false) =>
+                self.on_speech_ended(chunk_count, audio, start_ms, chunk, completed),
+        }
+    }
+
+    // ── Transiciones ──────────────────────────────────────────────────────────
+
+    fn on_speech_started(&self, chunk: &[i16]) -> TurnState {
+        println!("[VAD] {} ▶ speech started", self.speaker);
+        TurnState::Speech {
+            chunk_count:   1,
+            audio:         chunk.to_vec(),
+            start_ms:      now_ms(),
+            hangover_left: config::vad::HANGOVER_CHUNKS,
+        }
+    }
+
+    fn on_speech_ended(
+        &mut self,
+        chunk_count: usize,
+        mut audio:   Vec<i16>,
+        start_ms:    u128,
+        chunk:       &[i16],
+        completed:   &mut Vec<SpeechTurn>,
+    ) -> TurnState {
+        audio.extend_from_slice(chunk);
+        let end_ms = now_ms();
+
+        if chunk_count >= config::vad::MIN_SPEECH_CHUNKS {
+            self.emit_turn(audio, start_ms, end_ms, chunk_count, completed);
+        } else {
+            println!("[VAD] {} ✗ noise burst discarded ({chunk_count} chunks)", self.speaker);
+        }
+
+        self.vad.reset();
+        TurnState::Silence
+    }
+
+    fn emit_turn(
+        &self,
+        audio:       Vec<i16>,
+        start_ms:    u128,
+        end_ms:      u128,
+        chunk_count: usize,
+        completed:   &mut Vec<SpeechTurn>,
+    ) {
+        println!(
+            "[VAD] {} ■ turn ended ({chunk_count} chunks, {}ms)",
+            self.speaker,
+            end_ms.saturating_sub(start_ms),
+        );
+        completed.push(SpeechTurn { speaker: self.speaker, audio, start_ms, end_ms });
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    fn drain_next_chunk(&mut self) -> Vec<i16> {
+        self.sample_buf.drain(..config::vad::CHUNK_SAMPLES).collect()
+    }
+}
+
+// ── Transiciones puras (sin acceso a self) ────────────────────────────────────
+
+fn speech_continued(chunk_count: usize, mut audio: Vec<i16>, start_ms: u128, chunk: &[i16]) -> TurnState {
+    audio.extend_from_slice(chunk);
+    TurnState::Speech {
+        chunk_count:   chunk_count + 1,
+        audio,
+        start_ms,
+        hangover_left: config::vad::HANGOVER_CHUNKS,
+    }
+}
+
+fn speech_in_hangover(
+    chunk_count:   usize,
+    mut audio:     Vec<i16>,
+    start_ms:      u128,
+    hangover_left: usize,
+    chunk:         &[i16],
+) -> TurnState {
+    audio.extend_from_slice(chunk);
+    TurnState::Speech {
+        chunk_count,
+        audio,
+        start_ms,
+        hangover_left: hangover_left - 1,
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn i16_chunk_to_f32(chunk: &[i16]) -> Vec<f32> {
+    chunk.iter().map(|&s| s as f32 / 32_768.0).collect()
 }
 
 fn now_ms() -> u128 {

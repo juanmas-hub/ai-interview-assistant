@@ -13,8 +13,6 @@ use crate::stt::deepgram::DeepgramSender;
 use crate::ai::{AiServices, vector_store::VectorStore};
 use crate::config::Environment;
 
-// ── Tipos ─────────────────────────────────────────────────────────────────────
-
 struct Pipeline {
     audio_rx:         mpsc::Receiver<AudioEvent>,
     pause_flag:       PauseFlag,
@@ -38,8 +36,6 @@ struct AudioRouter {
     system:       AudioProcessor,
     conversation: Vec<SpeechTurn>,
 }
-
-// ── Punto de entrada ──────────────────────────────────────────────────────────
 
 pub async fn start(env: Environment) -> Result<()> {
     let pipeline = build(env).await?;
@@ -81,8 +77,6 @@ async fn connect_stt(
     ))
 }
 
-// ── AudioProcessor ────────────────────────────────────────────────────────────
-
 impl AudioProcessor {
     fn new(speaker: Speaker, stt: Box<dyn SttSender>) -> Self {
         Self {
@@ -109,8 +103,6 @@ impl AudioProcessor {
         turns
     }
 }
-
-// ── AudioRouter ───────────────────────────────────────────────────────────────
 
 impl AudioRouter {
     fn new(user_stt: Box<dyn SttSender>, system_stt: Box<dyn SttSender>) -> Self {
@@ -146,8 +138,6 @@ impl AudioRouter {
         }
     }
 }
-
-// ── Tasks async ───────────────────────────────────────────────────────────────
 
 async fn run_audio(
     mut rx:     mpsc::Receiver<AudioEvent>,
