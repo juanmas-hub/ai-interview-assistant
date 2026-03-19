@@ -1,9 +1,10 @@
 use anyhow::Result;
-use crate::ai::{embedder, vector_store::VectorStore};
 
-pub async fn load(context: &str) -> Result<VectorStore> {
+use crate::ai::{AiServices, vector_store::VectorStore};
+
+pub async fn load(context: &str, services: &AiServices) -> Result<VectorStore> {
     let chunks  = chunk_context(context);
-    let vectors = embed_chunks(&chunks).await?;
+    let vectors = embed_chunks(&chunks, services).await?;
     let store   = build_store(&chunks, vectors);
 
     println!("[setup] store listo — {} chunks cargados", store.len());
@@ -19,10 +20,10 @@ fn chunk_context(context: &str) -> Vec<String> {
         .collect()
 }
 
-async fn embed_chunks(chunks: &[String]) -> Result<Vec<Vec<f32>>> {
+async fn embed_chunks(chunks: &[String], services: &AiServices) -> Result<Vec<Vec<f32>>> {
     println!("[setup] vectorizando {} chunks…", chunks.len());
     let texts: Vec<&str> = chunks.iter().map(String::as_str).collect();
-    embedder::embed_batch(&texts).await
+    services.embedder.embed_batch(&texts).await
 }
 
 fn build_store(chunks: &[String], vectors: Vec<Vec<f32>>) -> VectorStore {
