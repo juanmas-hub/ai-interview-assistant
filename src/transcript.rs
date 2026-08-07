@@ -24,3 +24,32 @@ impl Transcript {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_transcript_path() -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("ai_interview_assistant_transcript_{unique}.txt"))
+    }
+
+    #[test]
+    fn write_line_persists_content_to_disk() {
+        let path = temp_transcript_path();
+        let mut transcript = Transcript::open(path.to_str().unwrap());
+
+        transcript.write_line("hello\n");
+
+        let written = fs::read_to_string(&path).unwrap();
+        assert_eq!(written, "hello\n");
+
+        let _ = fs::remove_file(path);
+    }
+}

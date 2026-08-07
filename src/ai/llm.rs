@@ -98,3 +98,47 @@ struct Choice {
 struct MessageContent {
     content: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_request_contains_system_and_user_messages() {
+        let prompt = Prompt {
+            system: "system prompt".to_string(),
+            user:   "user prompt".to_string(),
+        };
+
+        let request = build_request(prompt);
+
+        assert_eq!(request.model, MODEL);
+        assert_eq!(request.messages.len(), 2);
+        assert_eq!(request.messages[0].role, "system");
+        assert_eq!(request.messages[0].content, "system prompt");
+        assert_eq!(request.messages[1].role, "user");
+        assert_eq!(request.messages[1].content, "user prompt");
+    }
+
+    #[test]
+    fn extract_content_returns_error_when_choices_are_empty() {
+        let response = Response { choices: vec![] };
+
+        let err = extract_content(response).unwrap_err();
+        assert!(err.to_string().contains("no devolvió ninguna respuesta"));
+    }
+
+    #[test]
+    fn extract_content_returns_first_choice_content() {
+        let response = Response {
+            choices: vec![Choice {
+                message: MessageContent {
+                    content: "hello from llm".to_string(),
+                },
+            }],
+        };
+
+        let content = extract_content(response).unwrap();
+        assert_eq!(content, "hello from llm");
+    }
+}

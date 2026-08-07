@@ -89,3 +89,38 @@ struct Response {
 struct EmbeddingData {
     embedding: Vec<f32>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_request_uses_expected_model_and_inputs() {
+        let request = build_request(&["alpha", "beta"]);
+
+        assert_eq!(request.model, MODEL);
+        assert_eq!(request.input, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn extract_vectors_returns_error_when_response_is_empty() {
+        let response = Response { data: vec![] };
+
+        let err = extract_vectors(response).unwrap_err();
+        assert!(err.to_string().contains("no devolvió ningún embedding"));
+    }
+
+    #[test]
+    fn extract_vectors_converts_response_payloads_to_vectors() {
+        let response = Response {
+            data: vec![
+                EmbeddingData { embedding: vec![0.1, 0.2] },
+                EmbeddingData { embedding: vec![0.3, 0.4] },
+            ],
+        };
+
+        let embeddings = extract_vectors(response).unwrap();
+
+        assert_eq!(embeddings, vec![vec![0.1, 0.2], vec![0.3, 0.4]]);
+    }
+}

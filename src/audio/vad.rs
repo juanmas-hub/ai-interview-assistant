@@ -313,3 +313,82 @@ fn now_ms() -> u128 {
         .unwrap_or_default()
         .as_millis()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config;
+
+    #[test]
+    fn speech_continued_extends_audio_and_increments_chunk_count() {
+        let state = speech_continued(
+            2,
+            vec![1_i16, 2_i16],
+            10,
+            &[3_i16, 4_i16],
+        );
+
+        match state {
+            TurnState::Speech {
+                chunk_count,
+                audio,
+                start_ms,
+                hangover_left,
+            } => {
+                assert_eq!(chunk_count, 3);
+                assert_eq!(audio, vec![1_i16, 2_i16, 3_i16, 4_i16]);
+                assert_eq!(start_ms, 10);
+                assert_eq!(hangover_left, config::vad::HANGOVER_CHUNKS);
+            }
+            _ => panic!("expected speech state"),
+        }
+    }
+
+    #[test]
+    fn speech_in_hangover_decrements_hangover_left() {
+        let state = speech_in_hangover(
+            5,
+            vec![10_i16],
+            100,
+            2,
+            &[20_i16],
+        );
+
+        match state {
+            TurnState::Speech {
+                chunk_count,
+                audio,
+                start_ms,
+                hangover_left,
+            } => {
+                assert_eq!(chunk_count, 5);
+                assert_eq!(audio, vec![10_i16, 20_i16]);
+                assert_eq!(start_ms, 100);
+                assert_eq!(hangover_left, 1);
+            }
+            _ => panic!("expected speech state"),
+        }
+    }
+
+    #[test]
+    fn i16_chunk_to_f32_scales_values_to_unit_range() {
+        let converted = i16_chunk_to_f32(&[-16_384_i16, 0_i16, 16_384_i16]);
+
+        assert!((converted[0] + 0.5f32).abs() < f32::EPSILON);
+        assert_eq!(converted[1], 0.0f32);
+        assert!((converted[2] - 0.5f32).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn speech_turn_duration_secs_uses_target_sample_rate() {
+        let turn = SpeechTurn {
+            speaker: Speaker::User,
+            audio: vec![0_i16; 2_000],
+            start_ms: 0,
+            end_ms: 100,
+        };
+
+        let expected = 2_000.0f32 / config::resampler::TARGET_SAMPLE_RATE as f32;
+        assert!((turn.duration_secs() - expected).abs() < f32::EPSILON);
+    }
+}

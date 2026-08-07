@@ -87,3 +87,23 @@ fn open_wav_writer(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn record_chunk_initializes_writer_for_each_speaker() {
+        let mut recorder = CaptureRecorder::new();
+        let format = AudioFormat {
+            sample_rate: 16_000,
+            channels: 1,
+        };
+
+        recorder.record_chunk(Speaker::User, &[0.25f32, -0.25f32], format);
+        recorder.record_chunk(Speaker::System, &[0.5f32], format);
+
+        assert!(recorder.user_writer.is_some());
+        assert!(recorder.system_writer.is_some());
+    }
+}

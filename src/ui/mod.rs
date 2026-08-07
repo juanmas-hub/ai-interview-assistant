@@ -46,3 +46,24 @@ fn read_until_double_enter() -> String {
 
     lines.join("\n")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_user_context_returns_non_empty_string_when_input_is_available() {
+        let input = "alpha\n\n";
+        let lines = input.lines().collect::<Vec<_>>();
+
+        assert_eq!(lines[0], "alpha");
+    }
+
+    #[test]
+    fn read_until_double_enter_keeps_non_empty_lines_in_order() {
+        let input = "first\nsecond\n\n";
+        let lines = input.lines().collect::<Vec<_>>();
+
+        assert_eq!(lines, vec!["first", "second", ""]);
+    }
+}

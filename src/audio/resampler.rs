@@ -95,3 +95,34 @@ fn f32_slice_to_i16(samples: &[f32]) -> Vec<i16> {
         .collect()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn downmix_to_mono_keeps_single_channel_input_unchanged() {
+        let samples = vec![0.25f32, -0.5f32, 0.75f32];
+        let downmixed = Resampler::downmix_to_mono(&samples, 1);
+
+        assert_eq!(downmixed, samples);
+    }
+
+    #[test]
+    fn downmix_to_mono_averages_stereo_frames() {
+        let samples = vec![0.0f32, 1.0f32, 2.0f32, 4.0f32];
+        let downmixed = Resampler::downmix_to_mono(&samples, 2);
+
+        assert_eq!(downmixed, vec![0.5f32, 3.0f32]);
+    }
+
+    #[test]
+    fn f32_slice_to_i16_scales_values_to_i16_range() {
+        let samples = vec![-1.0f32, 0.0f32, 0.5f32];
+        let converted = f32_slice_to_i16(&samples);
+
+        assert_eq!(converted[0], -32_767);
+        assert_eq!(converted[1], 0);
+        assert_eq!(converted[2], 16_383);
+    }
+}
+

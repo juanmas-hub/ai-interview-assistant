@@ -16,5 +16,6 @@ desktop.ini
 
 test_sys.wav
 test_mic.wav
+*.wav
 
 *.txt

@@ -22,3 +22,38 @@ impl AudioNormalizer {
         resampler.resample(&mono)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::AudioFormat;
+
+    #[test]
+    fn process_returns_empty_for_empty_input() {
+        let mut normalizer = AudioNormalizer::new();
+        let format = AudioFormat {
+            sample_rate: 16_000,
+            channels: 1,
+        };
+
+        match normalizer.process(&[], format) {
+            Ok(samples) => assert!(samples.is_empty()),
+            Err(err) => panic!("empty input should not error: {err}"),
+        }
+    }
+
+    #[test]
+    fn process_resamples_mono_input_without_error() {
+        let mut normalizer = AudioNormalizer::new();
+        let format = AudioFormat {
+            sample_rate: 16_000,
+            channels: 1,
+        };
+        let samples = vec![0.0f32; 4_096];
+
+        match normalizer.process(&samples, format) {
+            Ok(samples) => assert!(!samples.is_empty()),
+            Err(err) => panic!("mono input should be processed: {err}"),
+        }
+    }
+}

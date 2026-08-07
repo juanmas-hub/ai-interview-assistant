@@ -86,3 +86,63 @@ fn format_context_section(context: &[SearchResult]) -> String {
 
     format!("\nCandidate background (most relevant first):\n{entries}\n")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::vector_store::SearchResult;
+
+    fn search_results(payloads: &[&str]) -> Vec<SearchResult> {
+        payloads
+            .iter()
+            .enumerate()
+            .map(|(index, payload)| SearchResult {
+                payload: (*payload).to_string(),
+                score: 1.0 - (index as f32 * 0.1),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn build_sets_user_question_and_system_prompt() {
+        let prompt = build(&[], "Describe your experience with Rust");
+
+        assert_eq!(prompt.user, "Describe your experience with Rust");
+        assert!(prompt.system.contains("You are a technical interview copilot."));
+        assert!(prompt.system.contains("General rules:"));
+    }
+
+    #[test]
+    fn grounding_rule_without_context_uses_general_knowledge() {
+        let rule = grounding_rule(&[]);
+
+        assert!(rule.contains("general, widely-known technical knowledge ONLY"));
+        assert!(rule.contains("Do NOT invent a company name"));
+        assert!(rule.contains("NOT as a first-person personal anecdote"));
+    }
+
+    #[test]
+    fn grounding_rule_with_context_mentions_background_and_entry_count() {
+        let context = search_results(&["Built a Rust service", "Led an async migration"]);
+        let rule = grounding_rule(&context);
+
+        assert!(rule.contains("Ground your answer in the candidate's background below"));
+        assert!(rule.contains("up to 2 are provided precisely"));
+        assert!(rule.contains("Do NOT build every bullet around the same single project"));
+    }
+
+    #[test]
+    fn format_context_section_returns_empty_string_for_empty_context() {
+        assert!(format_context_section(&[]).is_empty());
+    }
+
+    #[test]
+    fn format_context_section_formats_entries_in_order() {
+        let context = search_results(&["Built a Rust service", "Led an async migration"]);
+        let section = format_context_section(&context);
+
+        assert!(section.starts_with("\nCandidate background (most relevant first):\n"));
+        assert!(section.contains("[1] Built a Rust service"));
+        assert!(section.contains("[2] Led an async migration"));
+    }
+}

@@ -86,3 +86,25 @@ fn truncate(s: &str, max: usize) -> &str {
         .map(|(i, _)| &s[..i])
         .unwrap_or(s)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chunk_context_trims_and_filters_empty_lines() {
+        let chunks = chunk_context("  alpha  \n\n\n beta \n");
+
+        assert_eq!(chunks, vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn truncate_shortens_long_strings() {
+        assert_eq!(truncate("abcdefghij", 5), "abcde");
+    }
+
+    #[test]
+    fn truncate_keeps_short_strings_unchanged() {
+        assert_eq!(truncate("abc", 10), "abc");
+    }
+}

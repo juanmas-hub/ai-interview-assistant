@@ -297,3 +297,72 @@ struct DgChannel {
 struct DgAlternative {
     transcript: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn accumulate_appends_fragments_with_spaces() {
+        let mut accumulated = String::new();
+
+        accumulate(&mut accumulated, "hello", Speaker::User);
+        accumulate(&mut accumulated, "world", Speaker::User);
+
+        assert_eq!(accumulated, "hello world");
+    }
+
+    #[test]
+    fn accumulate_ignores_empty_fragments() {
+        let mut accumulated = String::from("existing");
+
+        accumulate(&mut accumulated, "", Speaker::User);
+
+        assert_eq!(accumulated, "existing");
+    }
+
+    #[tokio::test]
+    async fn flush_turn_sends_completed_turn_and_clears_buffer() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut accumulated = String::from("hello world");
+
+        flush_turn(&mut accumulated, Speaker::System, &tx).await;
+
+        let turn = rx.recv().await.unwrap();
+        assert_eq!(turn.speaker, Speaker::System);
+        assert_eq!(turn.text, "hello world");
+        assert!(accumulated.is_empty());
+    }
+
+    #[test]
+    fn parse_results_event_returns_none_for_non_results_messages() {
+        let msg = Message::Text(r#"{"type":"Other"}"#.to_string());
+
+        assert!(parse_results_event(msg).is_none());
+    }
+
+    #[test]
+    fn parse_results_event_extracts_final_fragment() {
+        let msg = Message::Text(
+            r#"{"type":"Results","is_final":true,"channel":{"alternatives":[{"transcript":"hola"}]}}"#
+                .to_string(),
+        );
+
+        let event = parse_results_event(msg).unwrap();
+        assert_eq!(event.fragment.as_deref(), Some("hola"));
+        assert!(event.speech_final == false);
+    }
+
+    #[test]
+    fn parse_results_event_marks_speech_final_when_present() {
+        let msg = Message::Text(
+            r#"{"type":"Results","speech_final":true,"channel":{"alternatives":[{"transcript":"final"}]}}"#
+                .to_string(),
+        );
+
+        let event = parse_results_event(msg).unwrap();
+        assert!(event.fragment.is_none());
+        assert!(event.speech_final);
+    }
+}

@@ -77,3 +77,35 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         (a, b)             => dot / (a * b),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upsert_replaces_existing_entry_and_preserves_count() {
+        let mut store = VectorStore::new();
+        let vector = vec![1.0f32; config::ai::EMBEDDING_DIMS];
+
+        store.upsert("ctx-001", vector.clone(), "first");
+        store.upsert("ctx-001", vector.clone(), "updated");
+
+        assert_eq!(store.len(), 1);
+        let results = store.search(&vec![1.0f32; config::ai::EMBEDDING_DIMS], 5);
+        assert!(results.iter().any(|r| r.payload == "updated"));
+    }
+
+    #[test]
+    fn search_returns_top_k_results_ranked_by_score() {
+        let mut store = VectorStore::new();
+        let query = vec![1.0f32; config::ai::EMBEDDING_DIMS];
+
+        store.upsert("ctx-001", vec![1.0f32; config::ai::EMBEDDING_DIMS], "match");
+        store.upsert("ctx-002", vec![-1.0f32; config::ai::EMBEDDING_DIMS], "mismatch");
+
+        let results = store.search(&query, 1);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].payload, "match");
+    }
+}
