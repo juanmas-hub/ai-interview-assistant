@@ -3,8 +3,8 @@ mod stt;
 mod pipeline;
 mod ai;
 mod ui;
-mod setup;
 mod config;
+mod transcript;
 
 use anyhow::Result;
 use config::Environment;

@@ -1,10 +1,10 @@
 pub mod deepgram;
 
-use std::fs::File;
-use std::io::Write;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use crate::audio::Speaker;
+use crate::transcript::Transcript;
 
 pub struct TurnComplete {
     pub speaker: Speaker,
@@ -17,34 +17,21 @@ pub trait SttSender: Send + Sync + 'static {
 }
 
 pub async fn run(
-    mut rx:  mpsc::Receiver<TurnComplete>,
-    forward: mpsc::Sender<TurnComplete>,
+    mut rx:     mpsc::Receiver<TurnComplete>,
+    forward:    mpsc::Sender<TurnComplete>,
+    transcript: Arc<Mutex<Transcript>>,
 ) {
-    let mut transcript = open_transcript();
-
     while let Some(turn) = rx.recv().await {
         if turn.text.trim().is_empty() { continue; }
 
-        log_turn(&turn, &mut transcript);
+        log_turn(&turn, &transcript);
         let _ = forward.send(turn).await;
     }
 }
 
-fn open_transcript() -> File {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open("transcript.txt")
-        .expect("failed to open transcript.txt")
-}
-
-fn log_turn(turn: &TurnComplete, file: &mut File) {
+fn log_turn(turn: &TurnComplete, transcript: &Arc<Mutex<Transcript>>) {
     let line = format!("{}: {}\n", speaker_label(&turn.speaker), turn.text.trim());
-    print!("{line}");
-    if let Err(e) = file.write_all(line.as_bytes()) {
-        eprintln!("[transcript] write error: {e}");
-    }
+    transcript.lock().unwrap().write_line(&line);
 }
 
 fn speaker_label(speaker: &Speaker) -> &'static str {

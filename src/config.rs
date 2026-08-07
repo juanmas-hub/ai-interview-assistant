@@ -38,6 +38,10 @@ pub mod ai {
     pub const MIN_SCORE:      f32   = 0.30;
 }
 
+pub mod transcript {
+    pub const PATH: &str = "transcript.txt";
+}
+
 pub struct Environment {
     pub deepgram_api_key: String,
     pub pause_flag:       PauseFlag,

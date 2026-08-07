@@ -1,6 +1,7 @@
 pub mod resampler;
 pub mod hotkey;
 pub mod normalizer;
+pub mod router;
 pub mod vad;
 pub mod wasapi;
 pub mod wav_writer;

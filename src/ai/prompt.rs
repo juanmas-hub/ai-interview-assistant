@@ -13,29 +13,39 @@ pub fn build(context: &[SearchResult], question: &str) -> Prompt {
 }
 
 fn build_system_prompt(context: &[SearchResult]) -> String {
-    let context_block = format_context(context);
-
-    let context_section = if context_block.is_empty() {
-        String::new()
-    } else {
-        format!("Candidate background:\n{context_block}\n\n")
-    };
+    let context_section = format_context_section(context);
 
     format!(
-        "You are an expert assistant helping a candidate during a backend technical interview.\n\
-         Give 2-3 concise bullet points the candidate can use to answer the question.\n\
-         If candidate background is provided, use it to personalize the answer.\n\
-         Always complement with your own technical knowledge to give a complete, smart response.\n\
-         Do NOT ask questions. Do NOT elaborate. Just key points to mention.\n\n\
+        "You are a technical interview copilot. The interviewer just asked the \
+         candidate a question in real time — you have seconds, not minutes, to help.\n\
+         \n\
+         Respond with 2-4 short bullet points the candidate can glance at and say out loud.\n\
+         \n\
+         Rules:\n\
+         - Lead with the most relevant point first.\n\
+         - If the candidate's background below contains something directly relevant, \
+           anchor the answer in it — cite the specific project or experience by name, \
+           not a generic claim.\n\
+         - Fill any gaps with accurate general technical knowledge — never invent \
+           specifics about the candidate's background that aren't in the context below.\n\
+         - No preamble, no follow-up questions, no restating the question.\n\
+         - Prefer concrete nouns (technology names, numbers, tradeoffs) over vague \
+           adjectives.\n\
          {context_section}"
     )
 }
 
-fn format_context(context: &[SearchResult]) -> String {
-    context
+fn format_context_section(context: &[SearchResult]) -> String {
+    if context.is_empty() {
+        return String::new();
+    }
+
+    let entries = context
         .iter()
         .enumerate()
         .map(|(i, r)| format!("[{}] {}", i + 1, r.payload))
         .collect::<Vec<_>>()
-        .join("\n\n")
+        .join("\n\n");
+
+    format!("\nCandidate background (most relevant first):\n{entries}\n")
 }
