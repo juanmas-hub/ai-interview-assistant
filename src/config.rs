@@ -30,6 +30,7 @@ pub mod deepgram {
         "&interim_results=true",
         "&endpointing=300",
     );
+    pub const FLUSH_GRACE_MS: u64 = 500;
 }
 
 pub mod ai {

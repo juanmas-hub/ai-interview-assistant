@@ -3,6 +3,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::time::{Duration, Instant};
 use tokio_tungstenite::{
     connect_async,
     MaybeTlsStream, WebSocketStream,
@@ -89,7 +90,7 @@ impl DeepgramConnection {
                 }
                 Err(e) => {
                     eprintln!("[deepgram] {} reconnect failed: {e}, retrying in 2s…", self.speaker);
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
                 }
             }
         }
@@ -116,6 +117,11 @@ enum SessionOutcome {
     Done,
 }
 
+enum WsOutcome {
+    Continue,
+    StreamClosed,
+}
+
 impl DeepgramSession {
     async fn run(
         mut self,
@@ -125,41 +131,78 @@ impl DeepgramSession {
         turn_complete_tx: &mpsc::Sender<TurnComplete>,
         accumulated:      &mut String,
     ) -> SessionOutcome {
+        let mut flush_deadline: Option<Instant> = None;
+
         loop {
             tokio::select! {
                 msg = self.stream.next() => {
-                    if !self.on_ws_message(msg, accumulated, speaker) {
-                        return SessionOutcome::StreamClosed;
+                    match self.on_ws_message(msg, accumulated, speaker, turn_complete_tx, &mut flush_deadline).await {
+                        WsOutcome::Continue     => {}
+                        WsOutcome::StreamClosed => return SessionOutcome::StreamClosed,
                     }
                 }
                 audio = audio_rx.recv() => {
                     if !self.on_audio(audio) { return SessionOutcome::Done; }
                 }
                 end = end_turn_rx.recv() => {
-                    if !self.on_end_turn(end, speaker, accumulated, turn_complete_tx).await {
-                        return SessionOutcome::Done;
+                    match end {
+                        Some(_) => self.on_local_turn_end(&mut flush_deadline),
+                        None    => return SessionOutcome::Done,
                     }
+                }
+                _ = sleep_until_opt(flush_deadline) => {
+                    self.on_flush_timeout(accumulated, speaker, turn_complete_tx).await;
+                    flush_deadline = None;
                 }
             }
         }
     }
 
-    fn on_ws_message(
+    async fn on_ws_message(
         &self,
-        msg:         Option<Result<Message, tokio_tungstenite::tungstenite::Error>>,
-        accumulated: &mut String,
-        speaker:     Speaker,
-    ) -> bool {
+        msg:              Option<Result<Message, tokio_tungstenite::tungstenite::Error>>,
+        accumulated:      &mut String,
+        speaker:          Speaker,
+        turn_complete_tx: &mpsc::Sender<TurnComplete>,
+        flush_deadline:   &mut Option<Instant>,
+    ) -> WsOutcome {
         let msg = match msg {
             Some(Ok(m)) => m,
-            _           => return false,
+            _           => return WsOutcome::StreamClosed,
         };
 
-        if let Some(fragment) = parse_is_final(msg) {
+        let Some(event) = parse_results_event(msg) else {
+            return WsOutcome::Continue;
+        };
+
+        if let Some(fragment) = event.fragment {
             accumulate(accumulated, &fragment, speaker);
         }
 
-        true
+        if event.speech_final {
+            flush_turn(accumulated, speaker, turn_complete_tx).await;
+            *flush_deadline = None; 
+        }
+
+        WsOutcome::Continue
+    }
+
+    fn on_local_turn_end(&self, flush_deadline: &mut Option<Instant>) {
+        if flush_deadline.is_none() {
+            *flush_deadline = Some(Instant::now() + Duration::from_millis(config::deepgram::FLUSH_GRACE_MS));
+        }
+    }
+
+    async fn on_flush_timeout(
+        &self,
+        accumulated:      &mut String,
+        speaker:          Speaker,
+        turn_complete_tx: &mpsc::Sender<TurnComplete>,
+    ) {
+        if !accumulated.trim().is_empty() {
+            eprintln!("[deepgram] {speaker} speech_final no llegó a tiempo — flush por fallback");
+        }
+        flush_turn(accumulated, speaker, turn_complete_tx).await;
     }
 
     fn on_audio(&self, audio: Option<Vec<u8>>) -> bool {
@@ -168,32 +211,28 @@ impl DeepgramSession {
             None        => false,
         }
     }
-
-    async fn on_end_turn(
-        &self,
-        end:              Option<()>,
-        speaker:          Speaker,
-        accumulated:      &mut String,
-        turn_complete_tx: &mpsc::Sender<TurnComplete>,
-    ) -> bool {
-        match end {
-            Some(_) => {
-                let text = std::mem::take(accumulated);
-                let _ = turn_complete_tx.send(TurnComplete { speaker, text }).await;
-                true
-            }
-            None => false,
-        }
-    }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+async fn sleep_until_opt(deadline: Option<Instant>) {
+    match deadline {
+        Some(d) => tokio::time::sleep_until(d).await,
+        None    => std::future::pending().await,
+    }
+}
 
 fn accumulate(accumulated: &mut String, fragment: &str, speaker: Speaker) {
     if fragment.is_empty() { return; }
     if !accumulated.is_empty() { accumulated.push(' '); }
     accumulated.push_str(fragment);
     println!("[fragment] {speaker}: {fragment}");
+}
+
+async fn flush_turn(accumulated: &mut String, speaker: Speaker, turn_complete_tx: &mpsc::Sender<TurnComplete>) {
+    if accumulated.is_empty() {
+        return;
+    }
+    let text = std::mem::take(accumulated);
+    let _ = turn_complete_tx.send(TurnComplete { speaker, text }).await;
 }
 
 async fn sender_task(mut sink: WsSink, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
@@ -212,26 +251,41 @@ async fn open_websocket(api_key: &str) -> Result<(WsSink, WsStream)> {
     Ok(ws.split())
 }
 
-fn parse_is_final(msg: Message) -> Option<String> {
+struct ResultsEvent {
+    fragment:     Option<String>,
+    speech_final: bool,
+}
+
+fn parse_results_event(msg: Message) -> Option<ResultsEvent> {
     let text = msg.into_text().ok()?;
     let resp: DgResponse = serde_json::from_str(&text).ok()?;
 
-    if resp.kind != "Results"            { return None; }
-    if !resp.is_final.unwrap_or(false)   { return None; }
+    if resp.kind != "Results" {
+        return None;
+    }
 
-    resp.channel?
-        .alternatives
-        .into_iter()
-        .next()
-        .map(|a| a.transcript)
+    let speech_final = resp.speech_final.unwrap_or(false);
+    let is_final     = resp.is_final.unwrap_or(false);
+
+    let fragment = if is_final {
+        resp.channel
+            .and_then(|c| c.alternatives.into_iter().next())
+            .map(|a| a.transcript)
+            .filter(|t| !t.is_empty())
+    } else {
+        None
+    };
+
+    Some(ResultsEvent { fragment, speech_final })
 }
 
 #[derive(Deserialize)]
 struct DgResponse {
     #[serde(rename = "type")]
-    kind:     String,
-    is_final: Option<bool>,
-    channel:  Option<DgChannel>,
+    kind:         String,
+    is_final:     Option<bool>,
+    speech_final: Option<bool>,
+    channel:      Option<DgChannel>,
 }
 
 #[derive(Deserialize)]

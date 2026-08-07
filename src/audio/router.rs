@@ -95,7 +95,6 @@ pub async fn run_audio(
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn log_speech_turn(turn: &SpeechTurn) {
     println!("[TURN] {turn}");
