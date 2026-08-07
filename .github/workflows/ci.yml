@@ -1,0 +1,28 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [ "main", "develop" ]
+  pull_request:
+    branches: [ "main", "develop" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Instalar Rust estable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Configurar caché de Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Ejecutar cargo test
+        run: cargo test --all-features --workspace
