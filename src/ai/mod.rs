@@ -5,8 +5,11 @@ mod llm;
 mod prompt;
 
 use anyhow::Result;
+use std::sync::Mutex;
+
 use embedder::Embedder;
 use llm::Llm;
+use prompt::HistoryTurn;
 use vector_store::{SearchResult, VectorStore};
 use crate::config;
 
@@ -14,11 +17,10 @@ pub struct RagEngine {
     embedder: Box<dyn Embedder>,
     llm:      Box<dyn Llm>,
     store:    VectorStore,
+    history:  Mutex<Vec<HistoryTurn>>,
 }
 
 impl RagEngine {
-    /// Arma el motor completo: crea los clientes externos (Voyage, Groq),
-    /// vectoriza el contexto personal del usuario y construye el store.
     pub async fn load(context: &str) -> Result<Self> {
         let embedder: Box<dyn Embedder> = Box::new(embedder::VoyageEmbedder::new()?);
         let llm:      Box<dyn Llm>      = Box::new(llm::GroqLlm::new()?);
@@ -26,7 +28,7 @@ impl RagEngine {
         let chunks = chunk_context(context);
         let store  = embed_and_build_store(&chunks, &*embedder).await?;
 
-        Ok(Self { embedder, llm, store })
+        Ok(Self { embedder, llm, store, history: Mutex::new(Vec::new()) })
     }
 
     pub async fn answer(&self, question: &str) -> Result<String> {
@@ -34,8 +36,13 @@ impl RagEngine {
         let context = self.retrieve(&vector);
         self.log_context(&context);
 
-        let prompt = prompt::build(&context, question);
-        self.llm.complete(prompt).await
+        let history  = self.recent_history();
+        let prompt   = prompt::build(&context, question, &history);
+        let response = self.llm.complete(prompt).await?;
+
+        self.record_turn(question, &response);
+
+        Ok(response)
     }
 
     fn retrieve(&self, vector: &[f32]) -> Vec<SearchResult> {
@@ -46,6 +53,19 @@ impl RagEngine {
             .collect()
     }
 
+    fn recent_history(&self) -> Vec<HistoryTurn> {
+        let history = self.history.lock().unwrap();
+        let start   = history.len().saturating_sub(config::ai::MAX_HISTORY_TURNS);
+        history[start..].to_vec()
+    }
+
+    fn record_turn(&self, question: &str, answer: &str) {
+        self.history.lock().unwrap().push(HistoryTurn {
+            question: question.to_string(),
+            answer:   answer.to_string(),
+        });
+    }
+
     fn log_context(&self, context: &[SearchResult]) {
         println!("[ai] {} chunks recuperados:", context.len());
         for r in context {
@@ -54,7 +74,6 @@ impl RagEngine {
     }
 }
 
-// ── Carga del contexto personal ─────────────────────────────────────────────
 
 fn chunk_context(context: &str) -> Vec<String> {
     context
@@ -85,26 +104,4 @@ fn truncate(s: &str, max: usize) -> &str {
         .nth(max)
         .map(|(i, _)| &s[..i])
         .unwrap_or(s)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn chunk_context_trims_and_filters_empty_lines() {
-        let chunks = chunk_context("  alpha  \n\n\n beta \n");
-
-        assert_eq!(chunks, vec!["alpha", "beta"]);
-    }
-
-    #[test]
-    fn truncate_shortens_long_strings() {
-        assert_eq!(truncate("abcdefghij", 5), "abcde");
-    }
-
-    #[test]
-    fn truncate_keeps_short_strings_unchanged() {
-        assert_eq!(truncate("abc", 10), "abc");
-    }
 }

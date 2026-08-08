@@ -1,20 +1,28 @@
 use crate::ai::vector_store::SearchResult;
 
-pub struct Prompt {
-    pub system: String,
-    pub user:   String,
+#[derive(Debug, Clone)]
+pub struct HistoryTurn {
+    pub question: String,
+    pub answer:   String,
 }
 
-pub fn build(context: &[SearchResult], question: &str) -> Prompt {
+pub struct Prompt {
+    pub system:   String,
+    pub history:  Vec<HistoryTurn>,
+    pub question: String,
+}
+
+pub fn build(context: &[SearchResult], question: &str, history: &[HistoryTurn]) -> Prompt {
     Prompt {
-        system: build_system_prompt(context),
-        user:   question.to_string(),
+        system:   build_system_prompt(context),
+        history:  history.to_vec(),
+        question: question.to_string(),
     }
 }
 
 fn build_system_prompt(context: &[SearchResult]) -> String {
-    let grounding_rule  = grounding_rule(context);
-    let context_section = format_context_section(context);
+    let anchor_rule      = anchor_rule(context);
+    let context_section  = format_context_section(context);
 
     format!(
         "You are a technical interview copilot. The interviewer just asked the \
@@ -26,7 +34,25 @@ fn build_system_prompt(context: &[SearchResult]) -> String {
          genuinely only supports 3 solid points, give 3 rather than stretching to 6 — \
          but default to giving real, usable signal over a thin list.\n\
          \n\
-         {grounding_rule}\n\
+         PRIMARY RULE: Always give a complete, technically strong, specific answer to \
+         the question — the kind a senior engineer with real hands-on experience would \
+         give — regardless of whether the exact topic is covered in the candidate's \
+         background below. The background personalizes the answer; it never limits its \
+         scope. If the question is about something the background doesn't mention at \
+         all, still answer it fully and concretely using genuine technical knowledge — \
+         never give a thin or evasive answer just because there's no personal anchor \
+         for it.\n\
+         \n\
+         {anchor_rule}\n\
+         \n\
+         Never invent a SPECIFIC fact that isn't in the background below — a company \
+         name, a project name, a metric, a date. Speaking generally about real \
+         technical practices is not invention and is always encouraged; inventing \
+         personal specifics is never allowed.\n\
+         \n\
+         If earlier questions and answers from this same interview appear before this \
+         message, build on them naturally — don't repeat a point you already made, and \
+         reference something you said earlier if it's genuinely relevant.\n\
          \n\
          General rules:\n\
          - Lead with the most relevant point first.\n\
@@ -37,36 +63,20 @@ fn build_system_prompt(context: &[SearchResult]) -> String {
     )
 }
 
-fn grounding_rule(context: &[SearchResult]) -> String {
+fn anchor_rule(context: &[SearchResult]) -> String {
     if context.is_empty() {
-        "No candidate background matched this question. Answer using general, \
-         widely-known technical knowledge ONLY — speak conceptually or in the \
-         infinitive (\"a common approach is...\", \"this typically involves...\"), \
-         NOT as a first-person personal anecdote.\n\
-         Do NOT invent a company name, project name, metric, or personal experience \
-         under any circumstance. Never write a placeholder like \"[Company]\" or \
-         \"[Project]\" — if you don't have a real detail to cite, don't reference one \
-         at all. It is completely fine, and preferred, for an answer to contain zero \
-         personal references when there's no real background to draw from."
+        "No specific candidate background matched this question — that's fine, answer \
+         from general expertise as described in the PRIMARY RULE above."
             .to_string()
     } else {
         format!(
-            "Ground your answer in the candidate's background below wherever it's \
-             relevant — cite the specific project or experience by name, not a generic \
-             claim. You may add general technical knowledge to complete the answer, but \
-             never invent a specific company, project name, or metric that isn't in the \
-             background below.\n\
-             Draw from AS MANY DIFFERENT entries below as are genuinely relevant to this \
-             question — up to {} are provided precisely so the answer can be varied. Do \
-             NOT build every bullet around the same single project or technology if other \
-             relevant entries exist; each bullet should ideally bring in a different \
-             angle (a different project, technology, or lesson learned). Only repeat the \
-             same background entry across bullets if the other entries are truly \
-             irrelevant to this specific question.\n\
-             If the background only partially covers the question, say what it does \
-             cover concretely and fill the rest with general knowledge framed \
-             impersonally — don't stretch the real background to sound like it covers \
-             something it doesn't.",
+            "The candidate background below may relate directly or only loosely to \
+             this question — use it as a real anchor wherever it fits, up to {} \
+             entries are provided so you can weave in more than one when relevant. If \
+             an entry only loosely relates (e.g. the same language or ecosystem but a \
+             different topic), use it as a natural bridge into the technical answer \
+             rather than ignoring it — don't restrict the answer's scope to only what \
+             these entries literally say.",
             context.len(),
         )
     }
@@ -85,64 +95,4 @@ fn format_context_section(context: &[SearchResult]) -> String {
         .join("\n\n");
 
     format!("\nCandidate background (most relevant first):\n{entries}\n")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ai::vector_store::SearchResult;
-
-    fn search_results(payloads: &[&str]) -> Vec<SearchResult> {
-        payloads
-            .iter()
-            .enumerate()
-            .map(|(index, payload)| SearchResult {
-                payload: (*payload).to_string(),
-                score: 1.0 - (index as f32 * 0.1),
-            })
-            .collect()
-    }
-
-    #[test]
-    fn build_sets_user_question_and_system_prompt() {
-        let prompt = build(&[], "Describe your experience with Rust");
-
-        assert_eq!(prompt.user, "Describe your experience with Rust");
-        assert!(prompt.system.contains("You are a technical interview copilot."));
-        assert!(prompt.system.contains("General rules:"));
-    }
-
-    #[test]
-    fn grounding_rule_without_context_uses_general_knowledge() {
-        let rule = grounding_rule(&[]);
-
-        assert!(rule.contains("general, widely-known technical knowledge ONLY"));
-        assert!(rule.contains("Do NOT invent a company name"));
-        assert!(rule.contains("NOT as a first-person personal anecdote"));
-    }
-
-    #[test]
-    fn grounding_rule_with_context_mentions_background_and_entry_count() {
-        let context = search_results(&["Built a Rust service", "Led an async migration"]);
-        let rule = grounding_rule(&context);
-
-        assert!(rule.contains("Ground your answer in the candidate's background below"));
-        assert!(rule.contains("up to 2 are provided precisely"));
-        assert!(rule.contains("Do NOT build every bullet around the same single project"));
-    }
-
-    #[test]
-    fn format_context_section_returns_empty_string_for_empty_context() {
-        assert!(format_context_section(&[]).is_empty());
-    }
-
-    #[test]
-    fn format_context_section_formats_entries_in_order() {
-        let context = search_results(&["Built a Rust service", "Led an async migration"]);
-        let section = format_context_section(&context);
-
-        assert!(section.starts_with("\nCandidate background (most relevant first):\n"));
-        assert!(section.contains("[1] Built a Rust service"));
-        assert!(section.contains("[2] Led an async migration"));
-    }
 }

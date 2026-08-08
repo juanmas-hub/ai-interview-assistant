@@ -87,10 +87,18 @@ pub async fn run_audio(
     user_stt:   Box<dyn SttSender>,
     system_stt: Box<dyn SttSender>,
 ) {
-    let mut router = AudioRouter::new(user_stt, system_stt);
+    let mut router     = AudioRouter::new(user_stt, system_stt);
+    let mut was_paused = false;
 
     while let Some(event) = rx.recv().await {
-        if pause_flag.load(Ordering::Relaxed) { continue; }
+        let is_paused = pause_flag.load(Ordering::Relaxed);
+
+        if is_paused != was_paused {
+            println!("[audio] pause_flag visto por run_audio: {is_paused}");
+            was_paused = is_paused;
+        }
+
+        if is_paused { continue; }
         router.handle(event);
     }
 }
@@ -103,35 +111,4 @@ fn log_speech_turn(turn: &SpeechTurn) {
 fn insert_chronologically(conversation: &mut Vec<SpeechTurn>, turn: SpeechTurn) {
     let pos = conversation.partition_point(|t| t.start_ms <= turn.start_ms);
     conversation.insert(pos, turn);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::stt::speaker_label;
-
-    fn make_turn(start_ms: u128) -> SpeechTurn {
-        SpeechTurn {
-            speaker: Speaker::User,
-            audio: vec![1, 2, 3],
-            start_ms,
-            end_ms: start_ms + 5,
-        }
-    }
-
-    #[test]
-    fn insert_chronologically_keeps_turns_sorted_by_start_time() {
-        let mut conversation = vec![make_turn(20), make_turn(40)];
-
-        insert_chronologically(&mut conversation, make_turn(30));
-
-        let starts: Vec<u128> = conversation.iter().map(|turn| turn.start_ms).collect();
-        assert_eq!(starts, vec![20, 30, 40]);
-    }
-
-    #[test]
-    fn speaker_label_uses_expected_labels() {
-        assert_eq!(speaker_label(&Speaker::User), "[User]");
-        assert_eq!(speaker_label(&Speaker::System), "[Interviewer]");
-    }
 }

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use crate::audio::Speaker;
-use crate::transcript::Transcript;
+use crate::transcript::{LineKind, Transcript};
 
 pub struct TurnComplete {
     pub speaker: Speaker,
@@ -30,14 +30,13 @@ pub async fn run(
 }
 
 fn log_turn(turn: &TurnComplete, transcript: &Arc<Mutex<Transcript>>) {
-    let line = format!("{}: {}\n", speaker_label(&turn.speaker), turn.text.trim());
-    transcript.lock().unwrap().write_line(&line);
+    transcript.lock().unwrap().log(line_kind_for(turn.speaker), &turn.text);
 }
 
-pub(crate) fn speaker_label(speaker: &Speaker) -> &'static str {
+fn line_kind_for(speaker: Speaker) -> LineKind {
     match speaker {
-        Speaker::User   => "[User]",
-        Speaker::System => "[Interviewer]",
+        Speaker::User   => LineKind::User,
+        Speaker::System => LineKind::Interviewer,
     }
 }
 
@@ -68,15 +67,18 @@ mod tests {
     }
 
     #[test]
-    fn speaker_label_returns_expected_value_for_each_speaker() {
-        assert_eq!(speaker_label(&Speaker::User), "[User]");
-        assert_eq!(speaker_label(&Speaker::System), "[Interviewer]");
+    fn line_kind_for_maps_each_speaker() {
+        assert_eq!(line_kind_for(Speaker::User), LineKind::User);
+        assert_eq!(line_kind_for(Speaker::System), LineKind::Interviewer);
     }
 
     #[test]
     fn log_turn_writes_formatted_line_to_transcript_file() {
         let path = temp_transcript_path();
-        let transcript = Arc::new(Mutex::new(Transcript::open(path.to_str().unwrap())));
+        let transcript = Arc::new(Mutex::new(Transcript::open(
+            path.to_str().unwrap(),
+            crate::transcript::new_live_transcript(),
+        )));
         let turn = TurnComplete {
             speaker: Speaker::User,
             text: "Hello from tests".to_string(),
@@ -93,7 +95,10 @@ mod tests {
     #[tokio::test]
     async fn run_forwards_non_empty_turns_and_writes_transcript() {
         let path = temp_transcript_path();
-        let transcript = Arc::new(Mutex::new(Transcript::open(path.to_str().unwrap())));
+        let transcript = Arc::new(Mutex::new(Transcript::open(
+            path.to_str().unwrap(),
+            crate::transcript::new_live_transcript(),
+        )));
         let (tx, rx) = mpsc::channel(4);
         let (forward_tx, mut forward_rx) = mpsc::channel(4);
 

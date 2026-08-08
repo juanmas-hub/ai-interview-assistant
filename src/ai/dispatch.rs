@@ -4,7 +4,7 @@ use tokio::sync::mpsc;
 use crate::ai::RagEngine;
 use crate::audio::Speaker;
 use crate::stt::TurnComplete;
-use crate::transcript::Transcript;
+use crate::transcript::{LineKind, Transcript};
 
 pub async fn run_ai(
     mut rx:     mpsc::Receiver<TurnComplete>,
@@ -17,7 +17,6 @@ pub async fn run_ai(
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn is_interviewer_question(turn: &TurnComplete) -> bool {
     turn.speaker == Speaker::System
@@ -37,8 +36,7 @@ fn answer_in_background(
 }
 
 fn output_ai_response(response: &str, transcript: &Arc<Mutex<Transcript>>) {
-    let line = format!("[AI] {response}\n");
-    transcript.lock().unwrap().write_line(&line);
+    transcript.lock().unwrap().log(LineKind::Ai, response);
 }
 
 #[cfg(test)]
@@ -75,12 +73,15 @@ mod tests {
     #[test]
     fn output_ai_response_writes_prefixed_line_to_transcript() {
         let path = temp_transcript_path();
-        let transcript = Arc::new(Mutex::new(Transcript::open(path.to_str().unwrap())));
+        let transcript = Arc::new(Mutex::new(Transcript::open(
+            path.to_str().unwrap(),
+            crate::transcript::new_live_transcript(),
+        )));
 
         output_ai_response("hello", &transcript);
 
         let written = fs::read_to_string(&path).unwrap();
-        assert_eq!(written, "[AI] hello\n");
+        assert_eq!(written, "[AI]: hello\n");
 
         let _ = fs::remove_file(path);
     }

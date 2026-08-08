@@ -30,6 +30,7 @@ pub mod deepgram {
         "&interim_results=true",
         "&endpointing=300",
     );
+
     pub const FLUSH_GRACE_MS: u64 = 500;
 }
 
@@ -37,6 +38,8 @@ pub mod ai {
     pub const EMBEDDING_DIMS: usize = 512;
     pub const TOP_K:          usize = 6;
     pub const MIN_SCORE:      f32   = 0.30;
+
+    pub const MAX_HISTORY_TURNS: usize = 5;
 }
 
 pub mod transcript {

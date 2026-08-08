@@ -1,6 +1,6 @@
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::ai::RagEngine;
 use crate::ai::dispatch::run_ai;
@@ -10,12 +10,19 @@ use crate::audio::router::run_audio;
 use crate::config::{self, Environment};
 use crate::stt::{SttSender, TurnComplete};
 use crate::stt::deepgram::DeepgramSender;
-use crate::transcript::Transcript;
+use crate::transcript::{LiveTranscript, Transcript};
 
-pub async fn start(env: Environment) -> Result<()> {
-    let context    = crate::ui::prompt_user_context();
+pub async fn start(
+    env:             Environment,
+    live_transcript: LiveTranscript,
+    context_rx:      oneshot::Receiver<String>,
+) -> Result<()> {
+    let context = context_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("la ventana se cerró antes de confirmar el contexto inicial"))?;
+
     let rag_engine = Arc::new(RagEngine::load(&context).await?);
-    let transcript = Arc::new(Mutex::new(Transcript::open(config::transcript::PATH)));
+    let transcript = Arc::new(Mutex::new(Transcript::open(config::transcript::PATH, live_transcript)));
 
     let (audio_tx,         audio_rx)        = mpsc::channel::<AudioEvent>(1_000);
     let (turn_complete_tx, turn_complete_rx) = mpsc::channel::<TurnComplete>(256);
