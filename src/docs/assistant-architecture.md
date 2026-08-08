@@ -8,108 +8,105 @@
   - [2. Tech Stack \& External Crates](#2-tech-stack--external-crates)
   - [3. Module Map](#3-module-map)
   - [4. Core Data Types](#4-core-data-types)
-    - [`Speaker` (`audio/mod.rs`)](#speaker-audiomodrs)
-    - [`AudioFormat` (`audio/mod.rs`)](#audioformat-audiomodrs)
-    - [`AudioEvent` (`audio/mod.rs`)](#audioevent-audiomodrs)
-    - [`TurnComplete` (`stt/mod.rs`)](#turncomplete-sttmodrs)
-    - [`SpeechTurn` (`audio/vad.rs`)](#speechturn-audiovadrs)
-    - [`SearchResult` (`ai/vector_store.rs`)](#searchresult-aivector_storers)
+    - [`LineKind` / `TranscriptLine` (`transcript.rs`)](#linekind--transcriptline-transcriptrs)
+    - [`HistoryTurn` (`ai/prompt.rs`, private module — re-used by `ai/mod.rs`)](#historyturn-aipromptrs-private-module--re-used-by-aimodrs)
   - [5. Threads \& Async Tasks](#5-threads--async-tasks)
+    - [Why the split changed](#why-the-split-changed)
     - [Real OS threads (`std::thread::spawn`)](#real-os-threads-stdthreadspawn)
-    - [Tokio tasks (`tokio::spawn`)](#tokio-tasks-tokiospawn)
-    - [Why tokio at all](#why-tokio-at-all)
+    - [Tokio tasks (inside the `pipeline-runtime` thread's runtime)](#tokio-tasks-inside-the-pipeline-runtime-threads-runtime)
+    - [Startup handshake](#startup-handshake)
   - [6. End-to-End Data Flow](#6-end-to-end-data-flow)
   - [7. Component: Audio Capture (WASAPI)](#7-component-audio-capture-wasapi)
-    - [`AudioSource`](#audiosource)
-    - [Capture pipeline per source](#capture-pipeline-per-source)
-    - [`SendableDevice`](#sendabledevice)
-    - [Backpressure handling](#backpressure-handling)
   - [8. Component: Voice Activity Detection](#8-component-voice-activity-detection)
-    - [`VoiceDetector` trait](#voicedetector-trait)
-    - [`SileroVad`](#silerovad)
-    - [`VadChannel` — the turn-boundary state machine](#vadchannel--the-turn-boundary-state-machine)
   - [9. Component: Speech-to-Text (Deepgram)](#9-component-speech-to-text-deepgram)
-    - [Connection architecture](#connection-architecture)
-    - [Reconnection](#reconnection)
-    - [Transcript accumulation](#transcript-accumulation)
-    - [Wire protocol](#wire-protocol)
+    - [Current design: `speech_final` primary, local VAD as a bounded fallback](#current-design-speech_final-primary-local-vad-as-a-bounded-fallback)
+    - [`sleep_until_opt`](#sleep_until_opt)
   - [10. Component: RAG Engine](#10-component-rag-engine)
-    - [`RagEngine::load(context: &str)`](#ragengineloadcontext-str)
-    - [`RagEngine::answer(question: &str)`](#ragengineanswerquestion-str)
-    - [`VectorStore` (`ai/vector_store.rs`)](#vectorstore-aivector_storers)
-    - [Embedder / LLM clients](#embedder--llm-clients)
-    - [`ai/dispatch.rs` — question filtering \& fan-out](#aidispatchrs--question-filtering--fan-out)
+    - [`RagEngine::answer(question)`](#ragengineanswerquestion)
+    - [Prompt philosophy — a real reframing, not a tweak](#prompt-philosophy--a-real-reframing-not-a-tweak)
+    - [Concurrency note](#concurrency-note)
   - [11. Component: Transcript](#11-component-transcript)
-  - [12. Component: Hotkey / Pause Control](#12-component-hotkey--pause-control)
-  - [13. Design Patterns Used](#13-design-patterns-used)
-  - [14. External Integrations \& Protocols](#14-external-integrations--protocols)
-  - [15. Configuration](#15-configuration)
-    - [`Environment` (also in `config.rs`)](#environment-also-in-configrs)
-  - [16. Known Limitations \& Planned Work](#16-known-limitations--planned-work)
+  - [12. Component: Overlay UI](#12-component-overlay-ui)
+    - [`ui::run_blocking`](#uirun_blocking)
+    - [`OverlayApp`](#overlayapp)
+  - [13. Component: Hotkey / Pause Control](#13-component-hotkey--pause-control)
+  - [14. Design Patterns Used](#14-design-patterns-used)
+  - [15. External Integrations \& Protocols](#15-external-integrations--protocols)
+  - [16. Configuration](#16-configuration)
+  - [17. Known Limitations](#17-known-limitations)
+  - [18. Possible Next Steps](#18-possible-next-steps)
+    - [Observability](#observability)
+    - [Reliability](#reliability)
+    - [Containerization — honest assessment, not a straightforward "yes"](#containerization--honest-assessment-not-a-straightforward-yes)
+    - [Scalability](#scalability)
+    - [Persistence \& UX](#persistence--ux)
+    - [Testing](#testing)
 
 ---
 
 ## 1. System Overview
 
-AI Interview Copilot is a **real-time desktop assistant** (Windows-only) that listens to
-both sides of an online technical interview (candidate's microphone + interviewer's
-system audio via loopback), transcribes both streams concurrently, detects when the
+AI Interview Copilot is a **real-time Windows desktop assistant** that listens to both
+sides of an online technical interview (candidate's microphone + interviewer's system
+audio via loopback), transcribes both streams concurrently, detects when the
 interviewer finishes asking a question, and generates a concise, personalized answer
-using retrieval-augmented generation (RAG) over the candidate's own background.
+using retrieval-augmented generation (RAG) — now with genuine multi-turn conversation
+memory — over the candidate's own background.
 
 **Key properties:**
 
 - **Concurrent dual-stream audio**: microphone and system loopback are captured,
-  normalized, transcribed, and voice-activity-detected completely independently — the
-  code path for one speaker never blocks the other.
-- **Real-time, streaming**: every stage (capture → STT → RAG) is wired via async
-  channels; there is no batch processing step.
-- **Personalized**: the candidate's own background (typed once at startup) is embedded
-  and retrieved semantically per question, rather than sent wholesale to the LLM.
-- **Local-first VAD**: voice activity detection runs a local ONNX model (Silero VAD),
-  not a cloud API — only finalized speech segments are sent onward.
+  normalized, transcribed, and voice-activity-detected independently.
+- **Real-time, streaming**: capture → STT → RAG is wired via async channels end to end.
+- **Personalized but not limited by it**: the candidate's background is retrieved
+  semantically per question, but the LLM is instructed to always answer fully and
+  technically — the background personalizes the answer, it doesn't cap its scope.
+- **Session-aware**: the AI remembers the last few interviewer questions and its own
+  suggested answers, replayed as real conversation turns — not just isolated Q&A.
+- **Visual, not just console**: a native window (egui/eframe) collects the initial
+  context, shows a live, color-coded conversation preview, and exposes Pause/Resume and
+  Close controls.
 
-**Trust model / data flow at a glance:**
+**Process/thread ownership at a glance** — this is the one architectural decision most
+worth understanding before touching anything else:
 
 ```
-Windows audio devices (mic + system loopback)
-    ↕  WASAPI (native, blocking API)
-OS threads → ring buffers → tokio channels
-    ↕
-Async pipeline (tokio tasks): normalize → VAD → STT (Deepgram WS) → RAG (Voyage + Groq)
-    ↕
-transcript.txt + stdout
+Main thread (owned by winit/eframe — required on Windows)
+    → runs the overlay window's event loop, blocking, for the whole app lifetime
+
+"pipeline-runtime" thread (spawned from main)
+    → owns its own tokio::runtime::Runtime
+    → hosts every async task: audio routing, STT, RAG dispatch, Deepgram connections
 ```
 
-The application has no server component and no persistence beyond a single append-only
-transcript file — every run starts from a blank vector store built from whatever
-context the user types in that session.
+These two threads talk to each other only through a `tokio::sync::oneshot` channel (the
+initial context, sent once) and a couple of `Arc<...>` shared handles (`PauseFlag`,
+`LiveTranscript`) — there is no other coupling between "the window" and "the pipeline."
 
 ---
 
 ## 2. Tech Stack & External Crates
 
-From `Cargo.toml`:
+| Crate | Purpose |
+|---|---|
+| `tokio` (`full`) | Async runtime for the pipeline thread |
+| `anyhow` | Error propagation |
+| `wasapi` | Mic + system loopback capture |
+| `windows-sys` | F9 hotkey (`GetAsyncKeyState`) |
+| `ringbuf` | Lock-free bridge between OS capture threads and the async world |
+| `rubato` | Audio resampling (48kHz→16kHz) |
+| `ort` | ONNX Runtime — runs the embedded Silero VAD model |
+| `tokio-tungstenite` | Deepgram WebSocket client |
+| `futures-util` | Stream/sink combinators for the WebSocket split |
+| `serde` / `serde_json` | Deepgram, Voyage, Groq payloads |
+| `reqwest` (`json`) | HTTP client — Voyage AI, Groq |
+| `async-trait` | `async fn` in `Embedder`/`Llm`/`SttSender` traits |
+| `dotenvy` | Loads `.env` for API keys |
+| `hound` | WAV file I/O (`audio/wav_writer.rs`) |
+| `eframe` / `egui` | Native overlay window — setup screen + live conversation preview |
+| `mockall` (dev) | Mocking `SttSender` in `stt` unit tests |
 
-| Crate | Version | Purpose |
-|---|---|---|
-| `tokio` | 1.50 (`full`) | Async runtime — powers every task in the pipeline except raw audio capture |
-| `anyhow` | 1.0 | Error propagation (`Result<T>` almost everywhere) |
-| `wasapi` | 0.22 | Windows Audio Session API bindings — mic + system loopback capture |
-| `windows-sys` | 0.59 | Low-level Win32 bindings — used specifically for the F9 hotkey (`GetAsyncKeyState`) |
-| `ringbuf` | 0.4 | Lock-free SPSC ring buffer — bridges OS capture threads into the async world |
-| `rubato` | 0.16 | Audio resampling (`FftFixedIn`) — 48kHz→16kHz conversion |
-| `ort` | 2.0.0-rc.12 (`download-binaries`) | ONNX Runtime bindings — runs the embedded Silero VAD model |
-| `tokio-tungstenite` | 0.21 (`native-tls`) | WebSocket client — Deepgram streaming STT connection |
-| `futures-util` | 0.3 | Stream/sink combinators for the WebSocket split (`SplitSink`/`SplitStream`) |
-| `serde` / `serde_json` | 1.x | (De)serialization — Deepgram responses, Voyage/Groq request/response bodies |
-| `reqwest` | 0.12 (`json`) | HTTP client — Voyage AI embeddings, Groq chat completions |
-| `async-trait` | 0.1 | Enables `async fn` in the `Embedder`/`Llm`/`SttSender` traits |
-| `dotenvy` | 0.15 | Loads `.env` for API keys at startup |
-| `hound` | 3.5 | WAV file I/O (used by `audio/wav_writer.rs`, not covered in detail here) |
-
-**Not a workspace** — this is a single binary crate (`edition = "2024"`), unlike
-multi-crate systems. Everything lives under `src/`.
+Still a single binary crate, not a workspace.
 
 ---
 
@@ -119,601 +116,543 @@ multi-crate systems. Everything lives under `src/`.
 ai-interview-assistant (binary crate)
 │
 ├── src/
-│   ├── main.rs              # Entry point: loads Environment, starts hotkey listener,
-│   │                         # calls pipeline::start(), waits on ctrl_c
+│   ├── main.rs              # NOT async — owns the main thread for eframe/winit.
+│   │                         # Spawns the pipeline-runtime thread, then blocks
+│   │                         # running the overlay window.
 │   │
-│   ├── config.rs             # All tunable constants + Environment (env vars, PauseFlag)
-│   │
-│   ├── pipeline.rs           # Orchestrator: builds every dependency, wires channels,
-│   │                         # spawns the 3 top-level tokio tasks
-│   │
-│   ├── transcript.rs         # Single owner of transcript.txt (shared via Arc<Mutex<_>>)
+│   ├── config.rs             # All tunable constants + Environment
+│   ├── pipeline.rs           # Orchestrator: awaits initial context, wires channels,
+│   │                         # spawns the pipeline's 3 top-level tokio tasks
+│   ├── transcript.rs         # LineKind, TranscriptLine, LiveTranscript, Transcript
 │   │
 │   ├── audio/
-│   │   ├── mod.rs            # Speaker, AudioFormat, AudioEvent — shared vocabulary
-│   │   ├── router.rs         # AudioProcessor, AudioRouter, run_audio — per-speaker
-│   │   │                     # normalize→VAD→STT routing
+│   │   ├── mod.rs            # Speaker, AudioFormat, AudioEvent
+│   │   ├── router.rs         # AudioProcessor, AudioRouter, run_audio
 │   │   ├── normalizer.rs     # AudioNormalizer — resample + downmix + quantize to i16
 │   │   ├── resampler.rs      # Resampler — wraps rubato::FftFixedIn
-│   │   ├── vad.rs            # VoiceDetector trait, SileroVad, VadChannel (turn state machine)
-│   │   ├── wasapi.rs         # OS-thread-based capture from Windows audio devices
-│   │   ├── hotkey.rs         # F9 pause/resume listener (OS thread, polling GetAsyncKeyState)
-│   │   ├── wav_writer.rs     # (not covered — WAV file debug output)
-│   │   └── silero_vad.onnx   # Embedded VAD model (include_bytes!)
+│   │   ├── vad.rs            # VoiceDetector trait, SileroVad, VadChannel
+│   │   ├── wasapi.rs         # OS-thread-based capture
+│   │   ├── hotkey.rs         # F9 pause/resume listener (OS thread)
+│   │   ├── wav_writer.rs     # (not covered)
+│   │   └── silero_vad.onnx
 │   │
 │   ├── stt/
-│   │   ├── mod.rs            # TurnComplete, SttSender trait, run() — transcript logging + forward
-│   │   └── deepgram.rs       # DeepgramSender — WebSocket client with auto-reconnect
+│   │   ├── mod.rs            # TurnComplete, SttSender trait, run()
+│   │   └── deepgram.rs       # DeepgramSender — speech_final-driven, VAD-fallback flush
 │   │
-│   └── ai/
-│       ├── mod.rs            # RagEngine — owns embedder + llm + store, exposes answer()
-│       ├── dispatch.rs       # run_ai — filters interviewer questions, dispatches to RagEngine
-│       ├── embedder.rs       # Embedder trait, VoyageEmbedder (Voyage AI HTTP client)
-│       ├── llm.rs            # Llm trait, GroqLlm (Groq HTTP client)
-│       ├── prompt.rs         # Prompt construction (system + user message)
-│       └── vector_store.rs   # VectorStore — in-memory cosine-similarity search
+│   ├── ai/
+│   │   ├── mod.rs            # RagEngine — embedder + llm + store + session history
+│   │   ├── dispatch.rs       # run_ai — filters interviewer questions, dispatches
+│   │   ├── embedder.rs       # Embedder trait, VoyageEmbedder
+│   │   ├── llm.rs            # Llm trait, GroqLlm — builds full multi-turn message list
+│   │   └── vector_store.rs   # VectorStore — in-memory cosine-similarity search
+│   │   # ai/prompt.rs is private (mod prompt;) — HistoryTurn, Prompt, build()
+│   │
+│   └── ui/
+│       ├── mod.rs            # run_blocking() — entry point, runs on the caller's thread
+│       └── overlay.rs        # OverlayApp — eframe::App impl, setup + live preview
 │
-├── .env                       # DEEPGRAM_API_KEY, VOYAGE_API_KEY, GROQ_API_KEY
+├── .env
 └── Cargo.toml
 ```
 
-> **Note:** a `ui/` module is planned for a future visual overlay but does not exist
-> yet — the current interaction model is entirely console-based (`stdout` +
-> `transcript.txt`). Not covered in this document.
+> `ai/rag.rs` (an earlier, orphaned version of the RAG logic that predated `RagEngine`)
+> was deleted — it wasn't referenced by any `mod` declaration and duplicated what
+> `ai/mod.rs` now owns.
 
 ---
 
 ## 4. Core Data Types
 
-These types form the shared vocabulary that flows across module boundaries.
+Only what's new or changed since the last revision; unchanged types (`Speaker`,
+`AudioFormat`, `AudioEvent`, `TurnComplete`, `SpeechTurn`, `SearchResult`) aren't
+repeated here.
 
-### `Speaker` (`audio/mod.rs`)
-
-```rust
-pub enum Speaker { User, System }
-```
-
-`User` = microphone (the candidate). `System` = loopback output (the interviewer, in a
-typical call setup). This single enum is what lets one code path serve both audio
-streams without duplicating logic — it's threaded through nearly every struct and
-message type in the system (`AudioEvent`, `TurnComplete`, `SpeechTurn`).
-
-### `AudioFormat` (`audio/mod.rs`)
+### `LineKind` / `TranscriptLine` (`transcript.rs`)
 
 ```rust
-pub struct AudioFormat { pub sample_rate: u32, pub channels: u16 }
+pub enum LineKind { User, Interviewer, Ai }
+
+pub struct TranscriptLine { pub kind: LineKind, pub text: String }
 ```
 
-Minimal `Copy` struct describing the format WASAPI actually delivered — used by the
-normalizer to know how to resample/downmix.
+Replaces what used to be pre-formatted `String` lines in the live transcript buffer.
+The UI can now style a line by matching on `kind` instead of parsing a `"[AI] ..."`
+prefix out of plain text — `Transcript::log()` is the single place that knows how a
+line is labeled, both for the file and for the UI.
 
-### `AudioEvent` (`audio/mod.rs`)
+### `HistoryTurn` (`ai/prompt.rs`, private module — re-used by `ai/mod.rs`)
 
 ```rust
-pub enum AudioEvent {
-    RawCapture { speaker: Speaker, samples: Vec<f32>, format: AudioFormat },
-    CaptureError { speaker: Speaker, error: String },
-}
+pub struct HistoryTurn { pub question: String, pub answer: String }
 ```
 
-The message type crossing the boundary from OS capture threads into the async
-pipeline. `samples: Vec<f32>` are raw PCM samples in `-1.0..=1.0`.
-
-### `TurnComplete` (`stt/mod.rs`)
-
-```rust
-pub struct TurnComplete { pub speaker: Speaker, pub text: String }
-```
-
-Emitted once Deepgram finalizes a transcript for a given speech turn (i.e. VAD detected
-silence and `end_turn()` was called).
-
-### `SpeechTurn` (`audio/vad.rs`)
-
-```rust
-pub struct SpeechTurn {
-    pub speaker: Speaker,
-    pub audio: Vec<i16>,
-    pub start_ms: u128,
-    pub end_ms: u128,
-}
-```
-
-A delimited segment of speech produced by the VAD state machine. Note: this carries
-**audio samples and timing**, not text — text arrives separately and later, from
-Deepgram.
-
-### `SearchResult` (`ai/vector_store.rs`)
-
-```rust
-pub struct SearchResult { pub payload: String, pub score: f32 }
-```
-
-A scored match from the vector store — `payload` is the original text chunk of the
-candidate's background, `score` is cosine similarity to the query.
+One (interviewer question, AI-suggested answer) pair. **Not** the candidate's own
+spoken answer — see [§17](#17-known-limitations).
 
 ---
 
 ## 5. Threads & Async Tasks
 
-This is one of the more important sections to get right — the system mixes **real OS
-threads** (`std::thread`) with **tokio async tasks**, and confusing the two leads to
-wrong assumptions about scheduling and blocking.
+The threading model changed substantially since the overlay UI was introduced — this
+section supersedes the previous revision entirely.
+
+### Why the split changed
+
+`eframe`/`winit` require the event loop to run on the process's **main thread** on
+Windows — this isn't a style preference, it's enforced (attempting otherwise panics:
+*"Initializing the event loop outside of the main thread is a significant
+cross-platform compatibility hazard"*). Since `main()` can't be `async` and own the
+event loop at the same time, the async pipeline was moved to its **own thread with its
+own `tokio::runtime::Runtime`**, leaving the main thread free for the window.
 
 ### Real OS threads (`std::thread::spawn`)
 
 | Thread | Spawned in | Purpose |
 |---|---|---|
-| Fill thread (mic) | `wasapi::spawn_fill_thread` via `start_concurrent_capture` | Blocks on WASAPI's event handle, drains the device buffer into a ring buffer |
-| Forward thread (mic) | `wasapi::spawn_forward_thread` | Drains the ring buffer, sends `AudioEvent` via `blocking_send` |
-| Fill thread (system loopback) | same, second call with `AudioSource::SystemLoopback` | Same role, other device |
-| Forward thread (system loopback) | same | Same role, other device |
-| Hotkey listener | `hotkey::spawn_hotkey_listener` (called from `main.rs` via `Environment::start_hotkey_listener`) | Polls `GetAsyncKeyState(VK_F9)` every 30ms, toggles `PauseFlag` |
+| Main thread | process entry | Owns `eframe::run_native` — the overlay window's event loop, for the whole app lifetime |
+| `pipeline-runtime` | `main.rs::spawn_pipeline` | Owns a dedicated `tokio::runtime::Runtime`; hosts every async task below |
+| Fill / forward threads (×2 per audio source) | `wasapi::start_concurrent_capture` | Unchanged — see previous capture section |
+| Hotkey listener | `Environment::start_hotkey_listener` | Unchanged — polls F9, toggles `PauseFlag` |
 
-**Total: 5 dedicated OS threads**, all blocking/polling loops that never touch the
-tokio runtime directly. They exist because WASAPI and `GetAsyncKeyState` are
-synchronous Win32 APIs with no async equivalent — bridging them into tokio via
-`spawn_blocking` was an option not taken; instead they communicate outward via a
-lock-free ring buffer (`ringbuf`) and a shared `AtomicBool` (`PauseFlag`), respectively.
-
-Why **two** threads per audio source instead of one: `fill_ring_buffer` blocks on
-`event_handle.wait_for_event(...)` (a WASAPI-level wait), while `forward_raw_audio`
-polls the ring buffer with a 1ms sleep when empty. Splitting them means a slow consumer
-(forwarding into a possibly-full tokio channel via `blocking_send`) can never delay the
-producer draining the device buffer — the ring buffer absorbs the difference, and
-overflow is logged (`push_to_ring_buffer`) rather than silently dropped without trace.
-
-### Tokio tasks (`tokio::spawn`)
+### Tokio tasks (inside the `pipeline-runtime` thread's runtime)
 
 | Task | Spawned in | Lifetime |
 |---|---|---|
+| `run_pipeline` (awaits `pipeline::start`, then blocks on ctrl_c or forever) | `main.rs::spawn_pipeline` | Application lifetime — this is what keeps the runtime (and everything below) alive; without it, the runtime would drop and kill every spawned task the moment `pipeline::start` returns |
 | `run_audio` | `pipeline::start` | Application lifetime |
 | `stt::run` | `pipeline::start` | Application lifetime |
 | `run_ai` (`ai::dispatch`) | `pipeline::start` | Application lifetime |
-| `DeepgramConnection::supervise` (×2, one per `Speaker`) | `DeepgramSender::connect` | Application lifetime — internally loops forever, reconnecting on stream close |
-| `sender_task` | `DeepgramConnection::open_session`, inside `supervise`'s loop | One per WebSocket session — re-spawned on every reconnect |
-| `answer_in_background` | `ai::dispatch::run_ai`, per qualifying question | Ephemeral — one per interviewer question that gets answered |
+| `DeepgramConnection::supervise` (×2) | `DeepgramSender::connect` | Application lifetime |
+| `sender_task` | Re-spawned on every Deepgram (re)connect | One per WebSocket session |
+| `answer_in_background` | `ai::dispatch::run_ai`, per question | Ephemeral |
 
-The three top-level tasks form the actual pipeline; everything else is either a fixed
-support task (Deepgram connection management) or dynamically spawned per unit of work
-(one task per AI answer, so a slow Groq response never blocks the next question from
-being detected).
+### Startup handshake
 
-### Why tokio at all
+```
+main thread                              pipeline-runtime thread
+────────────                             ────────────────────────
+Environment::load()
+start_hotkey_listener()
+create oneshot::channel()  ─────────────▶ spawn_pipeline(env, live_transcript, rx)
+                                              rt.block_on(run_pipeline(...))
+                                                pipeline::start(...)
+                                                  context_rx.await  ◀── blocks here
+ui::run_blocking(pause_flag,
+    live_transcript, context_tx)
+  → OverlayApp shows setup screen
+  → user clicks "Start session"
+  → context_tx.send(context)  ─────────────────▶ context_rx resolves
+                                                  RagEngine::load(context).await
+                                                  … rest of pipeline::start …
+  → window stays open, now showing
+    the live conversation preview
+```
 
-Every I/O-bound external call in this system is naturally async: two persistent
-Deepgram WebSocket connections, HTTP calls to Voyage AI and Groq. tokio lets these run
-concurrently as lightweight tasks multiplexed over a thread pool, rather than
-dedicating an OS thread to each blocked connection.
+The oneshot is deliberately **one-shot** at the type level (`Sender::send` consumes
+`self`) — the initial context can only ever be sent once, matching the fact that
+`RagEngine::load` only runs once per session.
 
 ---
 
 ## 6. End-to-End Data Flow
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│ OS THREADS (audio/wasapi.rs)                                        │
-│                                                                       │
-│  Mic device ──fill──▶ ring buffer ──forward──▶ AudioEvent::RawCapture│
-│  Loopback   ──fill──▶ ring buffer ──forward──▶ AudioEvent::RawCapture│
-└───────────────────────────────┬───────────────────────────────────────┘
-                                 │ audio_tx (mpsc, cap 1000)
-                                 ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│ TOKIO TASK: run_audio (audio/router.rs)                             │
-│                                                                       │
-│  AudioRouter routes by Speaker to the matching AudioProcessor:      │
-│    1. AudioNormalizer.process() → resample 48kHz→16kHz, downmix,    │
-│       quantize f32→i16                                              │
-│    2. stt.send_audio(i16 samples)  ───────────────────┐             │
-│    3. VadChannel.push() → detects turn boundaries      │             │
-│    4. on turn boundary: stt.end_turn()  ───────────────┤             │
-└───────────────────────────────┬─────────────────────────┼─────────────┘
-                                 │                          │
-                                 │ (samples)                │ (end_turn signal)
-                                 ▼                          ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│ DeepgramConnection (stt/deepgram.rs) — one per Speaker               │
-│                                                                       │
-│  Streams i16 PCM over WebSocket to Deepgram (linear16, 16kHz).      │
-│  Accumulates "is_final" transcript fragments.                       │
-│  On end_turn signal: flushes accumulated text as TurnComplete.      │
-└───────────────────────────────┬───────────────────────────────────────┘
-                                 │ turn_complete_tx (mpsc, cap 256)
-                                 ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│ TOKIO TASK: stt::run (stt/mod.rs)                                    │
-│                                                                       │
-│  Skips empty turns. Logs every turn to Transcript                   │
-│  ("[User]: ..." / "[Interviewer]: ..."). Forwards to ai_tx.         │
-└───────────────────────────────┬───────────────────────────────────────┘
-                                 │ ai_tx (mpsc, cap 256)
-                                 ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│ TOKIO TASK: run_ai (ai/dispatch.rs)                                  │
-│                                                                       │
-│  Filters: only Speaker::System (interviewer) turns proceed.          │
-│  Spawns an ephemeral task per question → RagEngine.answer():        │
-│    1. Embed the question (Voyage AI)                                │
-│    2. VectorStore.search() → top-K chunks above MIN_SCORE            │
-│    3. prompt::build() → system + user message                       │
-│    4. GroqLlm.complete() → bullet-point answer                      │
-│  Result logged to Transcript ("[AI] ...") and stdout.                │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-**Setup-time flow (runs once, before any of the above starts):**
+The capture → normalize → VAD → Deepgram pipeline is unchanged from the previous
+revision (see the diagram there if needed). What's new:
 
 ```
-ui::prompt_user_context() → user types background, one idea per line
-    ↓
-RagEngine::load(context)
-    1. Creates VoyageEmbedder + GroqLlm clients
-    2. chunk_context() → splits into lines
-    3. embed_and_build_store() → Voyage embeds all lines, VectorStore.upsert() each
-    ↓
-Arc<RagEngine> ready — shared into run_ai
+DeepgramSession (per speaker)
+    │  event.speech_final == true  → flush immediately (primary path)
+    │  OR local VAD end_turn() with no speech_final within FLUSH_GRACE_MS
+    │     → flush anyway (fallback path, logged when it fires)
+    ▼
+TurnComplete { speaker, text }
+    ▼
+stt::run
+    │  transcript.log(LineKind::User | LineKind::Interviewer, text)
+    │     → writes to transcript.txt AND pushes a TranscriptLine to LiveTranscript
+    ▼
+run_ai (filters Speaker::System only)
+    ▼
+RagEngine::answer(question)
+    1. embed(question) → Voyage
+    2. retrieve() → VectorStore search, TOP_K filtered by MIN_SCORE
+    3. recent_history() → last MAX_HISTORY_TURNS (question, answer) pairs
+    4. prompt::build(context, question, history) → Prompt { system, history, question }
+    5. GroqLlm::complete(prompt)
+         → build_request() replays history as real user/assistant message pairs,
+           THEN appends the current question — genuine multi-turn chat, not text
+           stuffed into the system prompt
+    6. record_turn(question, response) → pushed onto RagEngine's session history
+    ▼
+transcript.log(LineKind::Ai, response)
+    → writes to transcript.txt AND pushes a TranscriptLine (kind: Ai) to LiveTranscript
+    ▼
+OverlayApp repaints (polling live_transcript every ~300ms)
+    → AI lines rendered in a soft blue (Color32::from_rgb(122, 162, 247)),
+      everything else in the default text color
 ```
 
 ---
 
 ## 7. Component: Audio Capture (WASAPI)
 
-`audio/wasapi.rs` is the only module in the system that talks directly to Windows.
-
-### `AudioSource`
-
-```rust
-enum AudioSource { Microphone, SystemLoopback }
-```
-
-Maps to a WASAPI `Direction` (`Capture` for mic, `Render` for loopback — capturing from
-a render endpoint is how Windows exposes "what's playing through the speakers") and to
-a `Speaker` value.
-
-### Capture pipeline per source
-
-`spawn_capture_pipeline` does, for each source:
-1. `open_source` — initializes COM (`wasapi::initialize_mta`), opens the default device
-   for that direction, negotiates a 32-bit float format matching the device's native
-   sample rate (`init_capture_stream`), starts the WASAPI stream.
-2. Creates a `HeapRb<f32>` ring buffer (capacity: `config::capture::RING_BUFFER_CAPACITY`)
-   split into producer/consumer halves.
-3. `spawn_fill_thread` — OS thread that waits on WASAPI's event handle and drains
-   packets into the ring buffer producer (`fill_ring_buffer` → `drain_device_buffer` →
-   `read_next_packet` → `push_to_ring_buffer`).
-4. `spawn_forward_thread` — OS thread that polls the ring buffer consumer in
-   `CONSUMER_CHUNK_SIZE`-sized chunks and pushes `AudioEvent::RawCapture` into the
-   tokio `mpsc` channel via `blocking_send`.
-
-### `SendableDevice`
-
-```rust
-struct SendableDevice(OpenDevice);
-unsafe impl Send for SendableDevice {}
-unsafe impl Sync for SendableDevice {}
-```
-
-A manual `unsafe impl Send`/`Sync` wrapper — WASAPI's COM-based types aren't
-`Send`/`Sync` by default, but the code's actual usage pattern (create on one thread,
-move once into the fill thread, never touch from elsewhere) is safe in practice. This
-is a deliberate escape hatch around the type system, not an oversight.
-
-### Backpressure handling
-
-If the ring buffer fills up faster than the forward thread drains it,
-`push_to_ring_buffer` logs a dropped-sample count rather than blocking the fill thread
-(which must stay responsive to the WASAPI event handle). This is a deliberate
-audio-glitches-over-deadlocks tradeoff.
+Unchanged from the previous revision — see `audio/wasapi.rs`. Not affected by any of
+the recent work (Deepgram, RAG, or UI changes).
 
 ---
 
 ## 8. Component: Voice Activity Detection
 
-`audio/vad.rs` combines a neural VAD model with a hand-rolled turn-boundary state
-machine.
-
-### `VoiceDetector` trait
-
-```rust
-pub trait VoiceDetector: Send {
-    fn is_speech(&mut self, chunk: &[f32]) -> bool;
-    fn reset(&mut self);
-}
-```
-
-Abstracts the ML inference away from the state machine — `VadChannel` doesn't know or
-care that the concrete implementation is Silero/ONNX.
-
-### `SileroVad`
-
-Wraps a shared `ort::Session` (`static SHARED_SESSION: LazyLock<Arc<Mutex<Session>>>`,
-loaded once from the embedded `silero_vad.onnx` via `include_bytes!`). Each
-`SileroVad` instance keeps its own recurrent `state: Vec<f32>` (128×2 floats) — Silero
-is a stateful streaming model, so state must persist between chunks within a turn and
-reset between turns.
-
-`speech_probability` builds three ONNX input tensors (`audio`, `state`, `sr`) per call,
-runs inference under the shared session's mutex, and extracts both the speech
-probability and the updated recurrent state.
-
-### `VadChannel` — the turn-boundary state machine
-
-```rust
-enum TurnState {
-    Silence,
-    Speech { chunk_count: usize, audio: Vec<i16>, start_ms: u128, hangover_left: usize },
-}
-```
-
-Processes audio in fixed `CHUNK_SAMPLES` (512) windows. Transitions:
-
-| From | `is_speech` | To |
-|---|---|---|
-| `Silence` | `true` | `Speech` (turn started) |
-| `Silence` | `false` | `Silence` |
-| `Speech` | `true` | `Speech` (accumulate, reset hangover) |
-| `Speech` (hangover > 1) | `false` | `Speech` (accumulate, decrement hangover) |
-| `Speech` (hangover ≤ 1) | `false` | `Silence` (turn ends — emitted if long enough) |
-
-`MIN_SPEECH_CHUNKS` (3) filters out noise bursts — a "turn" shorter than this is
-discarded, not emitted. `HANGOVER_CHUNKS` (35) is how many consecutive silent chunks
-are tolerated before a turn is considered over — this absorbs natural pauses mid-sentence
-without fragmenting one utterance into many turns.
-
-The transition logic is implemented as pure functions (`speech_continued`,
-`speech_in_hangover`) taking no `&self` — only the state-mutating side effects
-(logging) go through methods that touch `self`.
-
-**Format note:** `VadChannel::push` accepts `&[i16]` (matching what
-`AudioNormalizer` produces for the STT sender) and internally converts back to `f32`
-(`i16_chunk_to_f32`) before calling `VoiceDetector::is_speech`, since Silero expects
-float input. This round-trip through 16-bit quantization exists only because the same
-normalized buffer is shared between the STT sender and the VAD — it is not required by
-either consumer individually.
+Unchanged from the previous revision — see `audio/vad.rs`. `VadChannel::push` still
+receives `i16` and round-trips to `f32` for Silero, which remains an open item (see
+[§17](#17-known-limitations)).
 
 ---
 
 ## 9. Component: Speech-to-Text (Deepgram)
 
-`stt/deepgram.rs` implements `SttSender` for a Deepgram streaming WebSocket connection,
-with automatic reconnection.
+This component changed the most structurally. The old design flushed a turn's
+transcript the moment the **local VAD** detected silence — this created a real race
+condition (confirmed in production logs) where a late-arriving Deepgram fragment for
+one utterance would get merged into the *next* utterance's turn, or a genuinely-spoken
+turn would be silently dropped because its text hadn't arrived from Deepgram yet when
+the local VAD closed the turn.
 
-### Connection architecture
+### Current design: `speech_final` primary, local VAD as a bounded fallback
 
 ```
-DeepgramSender (handle held by AudioProcessor)
-    │  audio_tx: mpsc::UnboundedSender<Vec<u8>>
-    │  end_turn_tx: mpsc::UnboundedSender<()>
-    ▼
-DeepgramConnection::supervise (tokio task, loops forever)
-    │  on each iteration: open_session() → DeepgramSession
-    ▼
-DeepgramSession::run (tokio::select! loop)
-    ├── stream.next()      → incoming transcript fragments from Deepgram
-    ├── audio_rx.recv()    → outgoing audio bytes → forwarded to sender_task
-    └── end_turn_rx.recv() → flush accumulated text as TurnComplete
+DeepgramSession::run — tokio::select! over 4 branches:
+  1. stream.next()      → incoming Deepgram messages
+  2. audio_rx.recv()     → outgoing audio bytes to forward to the socket
+  3. end_turn_rx.recv()  → local VAD says "turn probably ended"
+  4. sleep_until_opt(flush_deadline) → the fallback timer, if one is armed
 ```
 
-`sender_task` is a separate tokio task per session that owns the WebSocket's write
-half (`SplitSink`) — this decouples "receiving audio to send" from "receiving
-transcript messages," both of which the session's `select!` loop needs to service
-concurrently without one blocking the other.
+- **Primary path**: every `Results` message is parsed for both `is_final` (a text
+  fragment) and `speech_final` (Deepgram's own endpointing decision, enabled via
+  `config::deepgram::WS_URL`'s `endpointing=300`). When `speech_final` is `true`, the
+  accumulated text is flushed as a `TurnComplete` **in the same message**, so there's no
+  possible race with anything arriving out of order on a separate channel.
+- **Fallback path**: the local VAD's `end_turn()` (still called from
+  `AudioProcessor::process` in `audio/router.rs`) no longer flushes directly — it arms a
+  `flush_deadline` of `config::deepgram::FLUSH_GRACE_MS` (500ms) from now, *if none is
+  already armed*. If `speech_final` arrives before that deadline, the deadline is
+  cancelled. If it doesn't, the fallback fires: flushes whatever's accumulated, and logs
+  `"speech_final no llegó a tiempo — flush por fallback"` — this line is a real signal
+  worth watching for; frequent fallback firings would suggest Deepgram's endpointing
+  isn't closing turns reliably on the system-loopback channel specifically (this was
+  observed happening at least once with a 6.6-second silence gap in testing).
 
-### Reconnection
+### `sleep_until_opt`
 
-If the WebSocket stream closes (`SessionOutcome::StreamClosed`), `supervise` loops back
-and calls `open_session()` again. If the initial connection attempt fails, it retries
-after a fixed 2-second sleep. The only way `supervise` actually exits
-(`SessionOutcome::Done`) is if the *sender* half's channels close — i.e., the
-`DeepgramSender` handle itself was dropped.
+```rust
+async fn sleep_until_opt(deadline: Option<Instant>) {
+    match deadline {
+        Some(d) => tokio::time::sleep_until(d).await,
+        None    => std::future::pending().await,
+    }
+}
+```
 
-### Transcript accumulation
-
-Deepgram sends multiple `is_final` fragments per turn as speech continues.
-`accumulate()` concatenates them into a single string (space-separated); `on_end_turn`
-takes ownership of the accumulated string (`std::mem::take`) and emits it as a
-`TurnComplete`, resetting the buffer for the next turn.
-
-### Wire protocol
-
-Connects to `config::deepgram::WS_URL` (`nova-2` model, `linear16` encoding, 16kHz,
-mono, Spanish, server-side endpointing at 300ms). Authenticates via an `Authorization:
-Token {api_key}` header. Audio is sent as `Message::Binary` frames of raw little-endian
-`i16` PCM bytes.
+A small idiom worth knowing: this lets an `Option<Instant>` participate as a
+`tokio::select!` branch that simply never fires when there's nothing to wait for,
+without needing to conditionally include/exclude the branch itself.
 
 ---
 
 ## 10. Component: RAG Engine
 
-`ai/mod.rs` — `RagEngine` is the single owner of the embedding client, LLM client, and
-vector store; it exposes one behavioral method, `answer()`.
+`RagEngine` (`ai/mod.rs`) now carries session state across calls, not just static
+dependencies.
 
 ```rust
 pub struct RagEngine {
     embedder: Box<dyn Embedder>,
-    llm: Box<dyn Llm>,
-    store: VectorStore,
+    llm:      Box<dyn Llm>,
+    store:    VectorStore,
+    history:  Mutex<Vec<HistoryTurn>>,
 }
 ```
 
-### `RagEngine::load(context: &str)`
+### `RagEngine::answer(question)`
 
-Does the full one-time setup: constructs `VoyageEmbedder` and `GroqLlm` (both fallible
-— read API keys from env), chunks the raw context string by newline
-(`chunk_context`), embeds every chunk in one batched Voyage API call
-(`embed_and_build_store`), and upserts each into a fresh `VectorStore`.
+1. Embed the question, retrieve top-K context above `MIN_SCORE` (unchanged).
+2. `recent_history()` — takes the last `MAX_HISTORY_TURNS` entries from `history`
+   (locks, clones the slice, drops the lock — never holds the `std::sync::Mutex` guard
+   across an `.await`, which would fail to compile in an async fn).
+3. `prompt::build(context, question, history)` — see below.
+4. `GroqLlm::complete(prompt)` — sends the *actual conversation*, not a text blob.
+5. `record_turn(question, response)` — appends to `history` for future calls.
 
-### `RagEngine::answer(question: &str)`
+### Prompt philosophy — a real reframing, not a tweak
 
-1. Embeds the question (single embedding, not batched).
-2. `retrieve()` — cosine-similarity search against the store, `TOP_K` (6) results
-   filtered to `score >= MIN_SCORE` (0.30).
-3. Logs the retrieved chunks with their scores (`log_context`) — useful for debugging
-   why a particular answer did or didn't use certain background.
-4. `prompt::build()` — constructs a system prompt instructing the LLM to answer in 2-4
-   bullet points, anchor in the candidate's background when relevant, and never
-   fabricate background details not present in the retrieved context.
-5. `GroqLlm::complete()` — sends to `llama-3.1-8b-instant`.
+The previous prompt treated retrieved background as the *ceiling* of what the answer
+could cover ("ground your answer in the background... fill gaps with general
+knowledge"). In practice this made the model give thin or evasive answers whenever a
+question's topic wasn't explicitly present in a retrieved chunk — e.g. asked about
+observability with only a "has Rust experience" chunk retrieved, it wouldn't commit to
+a real technical answer about observability *in Rust*.
 
-### `VectorStore` (`ai/vector_store.rs`)
+The current prompt inverts this with an explicit **PRIMARY RULE**: always give a
+complete, technically strong answer regardless of whether the exact topic is in the
+background; the background *personalizes*, it never *limits scope*. A separate
+`anchor_rule` still governs how hard to lean on retrieved context (weave in multiple
+entries when relevant, use a loosely-related entry as a bridge rather than ignoring it)
+and a still-strict rule against inventing **specific** facts (company/project
+names, metrics, dates) remains — but general technical knowledge is now explicitly
+described as *always encouraged*, not just a fallback.
 
-```rust
-pub struct VectorStore { entries: Vec<Entry> }
-struct Entry { id: String, vector: [f32; EMBEDDING_DIMS], payload: String }
-```
+### Concurrency note
 
-Fixed-size `[f32; 512]` vectors (Voyage's `voyage-3-lite` dimension) — `to_fixed`
-converts the embedder's `Vec<f32>` and panics if the dimension doesn't match, since a
-mismatch would indicate a fundamentally broken embedding call, not a recoverable
-runtime condition. Search is brute-force cosine similarity over all entries
-(`score_all` → `rank_by_score` → `take_top`) — appropriate given the store never holds
-more than a few dozen entries (one per line of typed context).
-
-### Embedder / LLM clients
-
-Both `VoyageEmbedder` (`ai/embedder.rs`) and `GroqLlm` (`ai/llm.rs`) follow the same
-shape: a trait (`Embedder`/`Llm`) for testability/swappability, a `LazyLock<Client>`
-shared `reqwest` client, API key read from env at construction, and a
-build-request/call-api/extract-response pipeline of small functions. `VoyageEmbedder`
-supports true batching (`embed_batch`) used once at startup; `GroqLlm` only exposes
-single-prompt completion, since each interviewer question is answered independently.
-
-### `ai/dispatch.rs` — question filtering & fan-out
-
-```rust
-pub async fn run_ai(rx, rag_engine: Arc<RagEngine>, transcript: Arc<Mutex<Transcript>>)
-```
-
-Filters `TurnComplete` to `Speaker::System` only (`is_interviewer_question`) — the
-assumption being that in a typical call setup, system loopback audio is the
-interviewer's voice. Every qualifying turn spawns its own ephemeral task
-(`answer_in_background`) so that one slow LLM call never delays detecting or answering
-the next question.
+Since `RagEngine` is shared as `Arc<RagEngine>` and `ai::dispatch::run_ai` spawns one
+task per question, two questions arriving close together can run `answer()`
+concurrently. `history` is `Mutex`-protected, so there's no data race, but a second
+question's `recent_history()` snapshot may not yet include the first question's answer
+if the first hasn't finished. This is a deliberate tradeoff, not a bug: serializing
+`answer()` calls would delay responding to a new question while an older LLM call is
+still in flight, which is worse for a real-time tool.
 
 ---
 
 ## 11. Component: Transcript
 
-`transcript.rs` is the single owner of `transcript.txt`, introduced specifically to fix
-a prior design where two independent writers (`stt::run` and an AI-response writer)
-opened the same file with different semantics, creating a race condition on startup
-ordering.
+`transcript.rs` now owns **structured** lines, not pre-formatted strings.
 
 ```rust
-pub struct Transcript { file: File }
+pub struct Transcript { file: File, live: LiveTranscript }
 
 impl Transcript {
-    pub fn open(path: &str) -> Self { /* create+write+truncate, once */ }
-    pub fn write_line(&mut self, line: &str) { /* print + write, log on error */ }
+    pub fn open(path: &str, live: LiveTranscript) -> Self { ... }
+    pub fn log(&mut self, kind: LineKind, text: &str) { ... }
 }
 ```
 
-Shared as `Arc<Mutex<Transcript>>` between `stt::run` (writes `"[User]: ..."` /
-`"[Interviewer]: ..."` lines) and `ai::dispatch::run_ai` (writes `"[AI] ..."` lines) —
-two tokio tasks, potentially writing concurrently, synchronized by the `Mutex`. Each
-caller formats its own line (no shared format imposed by `Transcript` itself), since the
-two producers never had a shared line format to begin with.
+`log()` is the single place that decides both the file's line format
+(`"{label}: {text}\n"`, now consistent across all three `LineKind`s — the old `"[AI]
+..."` format without a colon was unified to match `"[User]: ..."` /
+`"[Interviewer]: ..."`) and what gets pushed into `LiveTranscript` for the UI. Both
+`stt::run` and `ai::dispatch::run_ai` call `transcript.log(...)` directly — neither
+formats a line string itself anymore, removing a duplicated formatting concern that
+used to live in two different modules.
 
 ---
 
-## 12. Component: Hotkey / Pause Control
+## 12. Component: Overlay UI
 
-`audio/hotkey.rs` — a minimal, purely additive control surface: a global `F9` toggle
-that pauses/resumes the entire pipeline without tearing anything down.
+New since the last revision. `ui/mod.rs` + `ui/overlay.rs` (the earlier `overlay.rs`
+/ `renderer.rs` / `egui_app.rs` three-way split collapsed to two files, since the
+original split never reflected a real responsibility boundary — see
+[§14](#14-design-patterns-used)).
+
+### `ui::run_blocking`
 
 ```rust
-pub type PauseFlag = Arc<AtomicBool>;
+pub fn run_blocking(pause_flag: PauseFlag, live_transcript: LiveTranscript, context_tx: oneshot::Sender<String>)
 ```
 
-`spawn_hotkey_listener` runs a dedicated OS thread polling
-`GetAsyncKeyState(VK_F9)` every 30ms (edge-detected via a `was_pressed` bool, so a
-single physical press toggles once, not repeatedly while held). Toggling is done with
-`fetch_xor(true, Ordering::Relaxed)` — flips the flag and returns the previous value in
-one atomic operation, avoiding a separate read-then-write race.
+Thin entry point — builds `eframe::NativeOptions` and calls `eframe::run_native`,
+blocking the calling thread (must be the main thread) until the window closes.
 
-The flag is read (not written) inside `run_audio`'s main loop
-(`audio/router.rs`) — when set, incoming `AudioEvent`s are dropped before reaching the
-`AudioRouter`, so nothing downstream (VAD, STT, transcript) sees any activity while
-paused.
+### `OverlayApp`
+
+Two screens, switched on `self.started`:
+
+- **Setup screen**: a multiline text box (empty by default, with a hint — the earlier
+  version had a bug where a placeholder-*looking* string was actually pre-filled real
+  content the user had to manually delete) and a "Start session" button.
+  `start_session()` calls `self.context_tx.take()` — the `Option<Sender<String>>`
+  wrapper is what makes "send exactly once" enforceable at the type level, regardless of
+  how many times the button is clicked.
+- **Session screen**: Pause/Resume (toggles the shared `PauseFlag` via `fetch_xor`),
+  Close (sends `ViewportCommand::Close`), and a scrolling conversation preview that
+  reads `LiveTranscript` and renders `LineKind::Ai` lines in a soft blue
+  (`Color32::from_rgb(122, 162, 247)`) — chosen specifically to be visually distinct
+  without reading as an alert/error color.
+
+`ctx.request_repaint_after(Duration::from_millis(300))` keeps the window refreshing on
+its own so new transcript lines appear without requiring user interaction — the
+transcript is being written from a completely different thread (the pipeline runtime),
+so the window has no other way to know new lines exist.
 
 ---
 
-## 13. Design Patterns Used
+## 13. Component: Hotkey / Pause Control
+
+Unchanged in implementation, but now has **two independent callers** toggling the same
+`PauseFlag`: the F9 OS-level listener (unchanged) and the overlay's Pause/Resume
+button. Both are clones of the same `Arc<AtomicBool>`, so either one flipping it should
+be visible to `run_audio`'s check in `audio/router.rs`. **This interaction currently has
+an open, unconfirmed bug** — see [§17](#17-known-limitations).
+
+---
+
+## 14. Design Patterns Used
+
+Only new/changed entries since the last revision:
 
 | Pattern | Where | Why |
 |---|---|---|
-| **Actor-style pipeline via channels** | `pipeline::start` wiring `audio_tx` → `turn_complete_tx` → `ai_tx` | Each stage (audio routing, STT relay, AI dispatch) is an independent tokio task; channels provide both communication and natural backpressure |
-| **State machine (explicit enum + transition function)** | `VadChannel` / `TurnState` | Turn-boundary detection has genuinely distinct states (silence vs. speech-with-hangover) with different valid transitions — modeling it as data makes invalid states unrepresentable |
-| **Trait objects for external dependencies** | `Box<dyn Embedder>`, `Box<dyn Llm>`, `Box<dyn SttSender>`, `Box<dyn VoiceDetector>` | Swappable providers (e.g., a mock STT sender for tests) without touching call sites |
-| **Shared ownership via `Arc`, single-writer via `Mutex`** | `Arc<RagEngine>`, `Arc<Mutex<Transcript>>`, `PauseFlag = Arc<AtomicBool>` | `RagEngine` is read-only after construction (no `Mutex` needed); `Transcript` has genuine concurrent writers; `PauseFlag` is a single bool, so an atomic suffices over a full `Mutex` |
-| **Supervisor / auto-reconnect loop** | `DeepgramConnection::supervise` | External WebSocket connections are inherently unreliable; the supervisor isolates reconnection logic from the rest of the pipeline, which never sees a dropped connection |
-| **Bridging blocking OS APIs into async via channels (not `spawn_blocking`)** | `wasapi.rs`, `hotkey.rs` | Dedicated OS threads communicate outward via a lock-free ring buffer / atomic flag, rather than occupying a tokio blocking-pool thread indefinitely |
-| **RAG (retrieval-augmented generation)** | `RagEngine` | Candidate background is embedded once, retrieved semantically per-question, keeping the LLM prompt small and relevant instead of stuffing the entire background into every call |
+| **Dedicated OS thread for a blocking event loop, with the async runtime moved elsewhere** | `main.rs` (window) vs. `pipeline-runtime` thread (tokio) | winit's Windows-only constraint (main thread must own the event loop) meant flipping which side gets a dedicated thread, rather than trying to force the GUI off-thread |
+| **One-shot handshake for a single startup value** | `oneshot::channel()` for the initial context | The value is fundamentally single-use (`RagEngine::load` runs once); `Sender::send(self, ...)` consuming the sender makes double-sending a compile error, not a runtime bug to guard against |
+| **Structured live state instead of pre-formatted display strings** | `TranscriptLine { kind, text }` replacing plain `String` | Keeps "how do we format a line" in one place (`Transcript::log`) instead of duplicating it in the module that produces the line and the module that displays it |
+| **Session state behind a `Mutex`, snapshotted before any `.await`** | `RagEngine.history` | `std::sync::MutexGuard` isn't `Send` across await points — `recent_history()` locks, clones, and drops the guard before any async work happens |
+| **Bounded fallback timer racing against a primary signal** | `DeepgramSession`'s `speech_final` vs. `flush_deadline` | Keeps the "authoritative" decision (Deepgram's own endpointing) as the fast path while still bounding the failure mode (turn never closes) to a fixed, small window instead of leaving it unbounded |
+| **Explicit reframing of an LLM instruction's priority ordering** | `ai/prompt.rs`'s `PRIMARY RULE` vs. `anchor_rule` | Discovered empirically that instructing "use the background, fill gaps with general knowledge" produced thin answers when the background didn't cover the topic — inverting which instruction is primary fixed it without touching retrieval at all |
 
 ---
 
-## 14. External Integrations & Protocols
+## 15. External Integrations & Protocols
 
-| Service | Protocol | Purpose | Auth |
-|---|---|---|---|
-| **Deepgram** | WebSocket (`wss://api.deepgram.com/v1/listen`), binary `linear16` PCM frames in, JSON transcript events out | Real-time speech-to-text, one connection per speaker | `Authorization: Token {DEEPGRAM_API_KEY}` header |
-| **Voyage AI** | HTTPS REST (`POST /v1/embeddings`), JSON | Text embeddings (`voyage-3-lite`, 512 dims) — both batch (startup) and single (per-question) | Bearer token (`VOYAGE_API_KEY`) |
-| **Groq** | HTTPS REST (`POST /openai/v1/chat/completions`, OpenAI-compatible schema), JSON | LLM completion (`llama-3.1-8b-instant`) | Bearer token (`GROQ_API_KEY`) |
-| **Windows WASAPI** | Native COM API (not network) | Microphone capture + system loopback capture | N/A (OS-level device permissions) |
-| **ONNX Runtime** | In-process, embedded model | Silero VAD inference | N/A (model bundled in binary via `include_bytes!`) |
+Unchanged table from the previous revision, with one behavioral note: Groq now
+receives the **full conversation** (system + alternating user/assistant messages for
+each history turn + the current question) on every call, not a single system+user pair
+— this increases the token count per request roughly linearly with
+`config::ai::MAX_HISTORY_TURNS`, worth keeping in mind if Groq costs or rate limits
+ever become a concern.
 
 ---
 
-## 15. Configuration
+## 16. Configuration
 
-`config.rs` centralizes every tunable constant, grouped by the subsystem that owns it:
+New/changed constants since the last revision:
 
-| Module | Constants | Used by |
+| Module | Constant | Purpose |
 |---|---|---|
-| `config::capture` | `RING_BUFFER_CAPACITY`, `CONSUMER_CHUNK_SIZE`, `EVENT_TIMEOUT_MS` | `audio/wasapi.rs` |
-| `config::resampler` | `TARGET_SAMPLE_RATE` (16kHz), `INPUT_CHUNK_FRAMES`, `SUB_CHUNKS` | `audio/resampler.rs`, `audio/vad.rs` (for `duration_secs`) |
-| `config::vad` | `CHUNK_SAMPLES`, `SPEECH_THRESHOLD`, `HANGOVER_CHUNKS`, `MIN_SPEECH_CHUNKS` | `audio/vad.rs` |
-| `config::deepgram` | `WS_URL` (full query string: model, language, encoding, sample rate, endpointing) | `stt/deepgram.rs` |
-| `config::ai` | `EMBEDDING_DIMS`, `TOP_K`, `MIN_SCORE` | `ai/vector_store.rs`, `ai/mod.rs` |
-| `config::transcript` | `PATH` (`"transcript.txt"`) | `pipeline.rs` (passed into `Transcript::open`) |
+| `config::deepgram` | `FLUSH_GRACE_MS` (500) | How long the fallback flush waits for `speech_final` before firing anyway |
+| `config::ai` | `MAX_HISTORY_TURNS` (5) | How many (question, answer) pairs are replayed to the LLM per call |
 
-### `Environment` (also in `config.rs`)
-
-```rust
-pub struct Environment { pub deepgram_api_key: String, pub pause_flag: PauseFlag }
-```
-
-Loaded once in `main.rs` via `Environment::load()` — reads `.env` (via `dotenvy`),
-required env var `DEEPGRAM_API_KEY` (panics if missing), and constructs a fresh
-`PauseFlag`. Note: `VOYAGE_API_KEY` and `GROQ_API_KEY` are **not** part of
-`Environment` — they're read directly inside `VoyageEmbedder::new()` /
-`GroqLlm::new()` at construction time, an inconsistency worth being aware of if you're
-looking for "where do API keys come from" in one place.
+Everything else (`capture`, `resampler`, `vad`, `ai::{EMBEDDING_DIMS,TOP_K,MIN_SCORE}`,
+`transcript::PATH`, `Environment`) is unchanged.
 
 ---
 
-## 16. Known Limitations & Planned Work
+## 17. Known Limitations
 
-Documented here for completeness, not as criticism — these are open items identified
-during the most recent refactor pass, not yet acted on:
+Carried over from the previous revision where still open, plus new items from this
+round of work:
 
-- **No visual UI yet.** All interaction is console-based (`stdin` prompt at startup,
-  `stdout` + `transcript.txt` during the session). A `ui/` module (`overlay`,
-  `renderer`) is planned but not implemented.
-- **`AudioRouter.conversation: Vec<SpeechTurn>`** (in `audio/router.rs`) is populated
-  but never read — likely scaffolding for a future "give the LLM full conversation
-  history" feature.
-- **f32 → i16 → f32 round-trip** between `AudioNormalizer` and `VadChannel`: the
-  normalizer quantizes to `i16` for the STT sender's benefit, and the VAD immediately
-  converts back to `f32` for the ONNX model. Not a correctness bug, but a precision
-  loss that a future pass could remove by having `DeepgramSender` quantize at the wire
-  boundary instead.
-- **`CaptureError { error: String }`** (in `audio/mod.rs`) is logged but never
-  programmatically distinguished by failure type — fine today since nothing reacts
-  differently to different capture failures.
-- **Heavy use of `.unwrap()`/`.expect()`** in `audio/vad.rs` (ONNX tensor construction,
-  session inference) means a malformed model output would panic the whole process
-  rather than degrade gracefully for a single chunk.
+- **Pause/Resume bug under active investigation.** The Pause button visibly stops
+  processing; Resume has been reported to not restore it. A diagnostic log was added to
+  `audio/router.rs` (`"[audio] pause_flag visto por run_audio: {is_paused}"`, printed
+  only on transition) to determine whether the flag itself fails to propagate back to
+  `false`, or whether something downstream (VAD state, a Deepgram session) is stuck for
+  an unrelated reason. **Root cause not yet confirmed as of this revision.**
+- **History captures the AI's suggested answer, not the candidate's actual spoken
+  answer.** `RagEngine.history` only ever records `(interviewer_question,
+  ai_suggested_answer)` — the candidate's own `Speaker::User` turns are transcribed and
+  shown, but never fed back into the LLM's conversation context. If the candidate
+  answers differently than suggested, later questions won't know that.
+- **f32 → i16 → f32 round-trip** between `AudioNormalizer` and `VadChannel` — still
+  unaddressed; a precision-loss issue, not a correctness bug.
+- **Heavy `.unwrap()`/`.expect()` usage in `audio/vad.rs`** (ONNX tensor construction,
+  inference) — a malformed model output still panics the whole process.
+- **`AudioRouter.conversation: Vec<SpeechTurn>`** — still populated, still unused.
 - **API key loading is split** between `Environment` (Deepgram) and individual client
-  constructors (Voyage, Groq) — see [§15](#15-configuration).
+  constructors (Voyage, Groq).
+- **No automated tests for `RagEngine.answer`'s history/retrieval logic** — `stt` and
+  `ai::dispatch` have unit tests for transcript logging and turn filtering, but the
+  session-history behavior (bounding to `MAX_HISTORY_TURNS`, correct ordering) is
+  currently only verified manually.
+
+---
+
+## 18. Possible Next Steps
+
+Organized by theme, roughly in the order they'd likely pay off given the project's
+current state (a single-user Windows desktop tool, not a hosted service).
+
+### Observability
+
+- Replace `println!`/`eprintln!` with the `tracing` crate — structured, leveled logs
+  (`debug!`/`info!`/`warn!`/`error!`) with fields instead of string interpolation,
+  which would make the Deepgram fallback-flush frequency, VAD state transitions, and
+  RAG retrieval scores all filterable/queryable instead of scrollback-only.
+- A per-session correlation ID (e.g. one UUID generated at `RagEngine::load` time)
+  threaded through every log line — useful the moment you're comparing behavior across
+  multiple practice sessions.
+- Lightweight metrics even just printed at shutdown: questions answered, average
+  Deepgram-fallback rate, average Groq/Voyage latency, VAD turns discarded as noise
+  bursts. Doesn't need a metrics backend (Prometheus etc.) for a single-user tool —
+  just needs to exist somewhere other than "scroll up in the terminal."
+
+### Reliability
+
+- Resolve the pause/resume bug (see [§17](#17-known-limitations)) — highest-priority
+  correctness item currently open.
+- Retry/backoff on Voyage/Groq HTTP failures — today a single failed call just logs
+  `[ai] error: ...` and the question goes unanswered; a transient network blip
+  shouldn't cost an entire interview question.
+- Feed the candidate's actual spoken answer into `RagEngine.history`, not just the
+  AI's suggestion (see [§17](#17-known-limitations)) — probably the single highest-value
+  change to answer quality on multi-question exchanges.
+
+### Containerization — honest assessment, not a straightforward "yes"
+
+This one deserves a real answer rather than a reflexive Dockerfile. **The app as a
+whole can't reasonably run in a container**, for two structural reasons:
+
+1. It links directly against Win32 APIs (`wasapi`, `windows-sys`/`GetAsyncKeyState`) —
+   it can only run in a **Windows container**, not Linux, ruling out the usual
+   Docker-for-Linux-containers tooling.
+2. Even in a Windows container: **audio device passthrough isn't a supported Docker
+   feature on Windows** the way it is on Linux (no equivalent of bind-mounting
+   `/dev/snd` or `pulseaudio` sockets) — there's no standard way to expose the host's
+   microphone/loopback devices to a Windows container. Same problem for the `eframe`
+   window itself: Windows Server Core / Nano Server containers don't have a compositor
+   for a native window to render into.
+
+**What actually is containerizable**: the parts of `ai/` that don't touch Windows APIs
+at all — `vector_store.rs`, `prompt.rs`, the `Embedder`/`Llm` trait definitions — have
+zero Windows dependencies. A genuinely useful next step here isn't "containerize the
+app," it's:
+
+- **Split the RAG/LLM logic into a small headless service** (HTTP or gRPC) that the
+  Windows client talks to over the network, instead of calling `RagEngine` in-process.
+  That service — no WASAPI, no `eframe`, no `windows-sys` — containerizes cleanly on
+  Linux, and would let you iterate on prompt/retrieval logic, add logging/metrics
+  infrastructure, or even serve multiple client installs from one place, without
+  touching the Windows-specific client at all.
+- Short of that: a **Dockerfile just for CI**, running `cargo test` against the
+  platform-independent modules on Linux, so tests for `vector_store`/`prompt` logic run
+  in a reproducible container even though the shippable binary never runs in one.
+
+### Scalability
+
+For a single-user local tool, "scalability" in the server sense (concurrent users,
+QPS) doesn't really apply. What *would* matter as the project grows:
+
+- **Bounding growth over a long session** — `VectorStore` and `transcript.txt` both
+  grow unboundedly with a very long interview; `RagEngine.history` is already bounded
+  (`MAX_HISTORY_TURNS`), the others currently aren't, though in practice a single
+  interview's context/transcript size is small enough that this is more of a
+  "eventually" concern than an urgent one.
+- If the RAG/LLM split above ever happens, *that's* the point where real scalability
+  questions (connection pooling, concurrent request handling, maybe caching repeated
+  embeddings) start to matter — deferring that discussion until the split exists is
+  reasonable rather than solving it prematurely on the current architecture.
+
+### Persistence & UX
+
+- **A simple local profile, not a login.** Since this is a single-user desktop tool
+  with no backend, "login" is the wrong frame — what's actually wanted is persisting
+  the typed context locally (e.g. a JSON file in `%APPDATA%`) so it's pre-filled (and
+  editable) on the next launch instead of retyped every session. A real login/auth
+  concept would only start making sense *if* the RAG service split above happens and
+  multiple client installs need to identify which candidate's profile to load — worth
+  deferring until then rather than building auth for a single local user today.
+- **Multiple named profiles** — since interview prep context can differ by role (e.g. a
+  backend-heavy pitch vs. a full-stack one), letting the setup screen save/load a few
+  named contexts would be a natural extension of the above.
+- **Post-interview export** — `transcript.txt` already has everything; a "save as
+  Markdown/PDF with timestamps" button on session close would turn it into something
+  worth reviewing afterward, rather than a debug artifact.
+
+### Testing
+
+- Unit tests for `RagEngine::answer`'s history bounding and ordering (mock
+  `Embedder`/`Llm` the same way `stt`'s tests mock `SttSender` with `mockall`).
+- A test asserting `flush_turn`'s empty-accumulated-text guard and the
+  `flush_deadline` cancel-on-`speech_final` logic in `stt/deepgram.rs`, since that's the
+  most failure-prone piece of logic added recently and currently has zero test coverage
+  of its own (only observed correct via manual log inspection).
