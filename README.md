@@ -1,27 +1,57 @@
-# AI Interview Assistant 🎙️🤖
+<div align="center">
+<img src=".github/logo.svg" alt="AI Interview Copilot" width="150"/>
 
-An intelligent assistant designed to help you during online technical interviews. It listens to your Google Meet or Zoom calls in real-time, processes the conversation, and provides contextual hints and answers on the fly — based on your own background and experience.
+# AI Interview Copilot
+
+Real-time desktop assistant that listens to both sides of a technical interview, transcribes them concurrently, and generates context-aware, personalized answers as the interviewer speaks.
+
+<a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-2024%20edition-orange.svg?logo=rust&logoColor=white" alt="Rust 2024 edition"/></a>
+<a href="https://tokio.rs/"><img src="https://img.shields.io/badge/tokio-1.50-blue.svg" alt="tokio 1.50"/></a>
+<a href="https://github.com/emilk/egui"><img src="https://img.shields.io/badge/egui-native%20UI-blueviolet.svg" alt="egui"/></a>
+<a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-brightgreen.svg" alt="License MIT"/></a>
+
+</div>
+
+---
+
+## What is this
+
+AI Interview Copilot captures your microphone and the interviewer's audio (via system loopback) at the same time, transcribes both streams in real time, and — the moment the interviewer finishes a question — retrieves the relevant parts of your own background and drafts a full, technically grounded answer you can glance at and say out loud.
+
+It's built as a real desktop tool: native Windows audio capture, a local voice-activity-detection model, a resilient streaming transcription pipeline, a session-aware RAG engine, and a native overlay window, running as a multi-threaded Rust application.
 
 ## Features
 
-- **Real-Time Audio Capture** — Captures both microphone and system audio concurrently using WASAPI (Windows).
-- **Voice Activity Detection** — Silero VAD detects when the interviewer finishes speaking before triggering a response.
-- **Speech-to-Text** — Deepgram transcribes both speakers in real-time via WebSocket.
-- **RAG Pipeline** — Your personal context is vectorized at startup and retrieved semantically for each question.
-- **AI-Powered Responses** — Groq (llama-3.1-8b-instant) generates concise bullet points you can use to answer.
-- **Transcript** — Every turn (interviewer, candidate, and AI) is saved to `transcript.txt`.
-- **Pause / Resume** — Press `F9` at any time to pause and resume audio capture.
+- **Real-time dual audio capture** — microphone and system audio captured and transcribed independently and concurrently via WASAPI.
+- **Local voice activity detection** — Silero VAD (ONNX Runtime) runs on-device to detect speech turns; no audio leaves your machine just to figure out when someone stopped talking.
+- **Streaming transcription** — Deepgram transcribes both speakers over WebSocket, with a hybrid turn-closing strategy (Deepgram's own endpoint detection as the primary signal, a bounded local fallback if it doesn't fire) for reliability.
+- **Session-aware RAG** — your background is embedded once (Voyage AI) and retrieved semantically per question. Answers stay grounded in your real experience but are never limited to only what's literally stored — the model always gives a complete, technical answer and personalizes it where relevant.
+- **Real conversation memory** — the last few questions and answers are replayed to the LLM as actual multi-turn chat history, not isolated one-off completions.
+- **Live overlay window** — type your background once at startup, then watch the conversation transcribe live, with the AI's suggested answers visually distinguished from the rest.
+- **Pause / Resume** — stop and resume audio processing instantly, from the window or the F9 hotkey.
+- **Hide / Unhide** — toggles whether the window is excluded from screen capture (Windows content-protection). Hidden by default on launch.
+- **Transcript export** — every turn (interviewer, candidate, and AI) is saved to `transcript.txt`.
+
+## Screenshots
+
+<img width="1039" height="831" alt="image" src="https://github.com/user-attachments/assets/150a3924-b5ae-4c1e-9d3e-fa500d9f0575" />
+<img width="987" height="780" alt="image" src="https://github.com/user-attachments/assets/49a3ac8a-8be8-49ee-990a-3d1ee0c078ad" />
+
 
 ## Tech Stack
 
 | Component | Technology |
 |---|---|
-| Audio capture | WASAPI (Windows native) |
-| Voice detection | Silero VAD (local ONNX model) |
-| Speech-to-text | Deepgram nova-2 |
+| Audio capture | WASAPI (native Windows) |
+| Voice activity detection | Silero VAD (ONNX Runtime, local) |
+| Speech-to-text | Deepgram (streaming WebSocket, nova-2) |
 | Embeddings | Voyage AI (voyage-3-lite, 512 dims) |
 | Vector store | In-memory cosine similarity |
-| LLM | Groq — llama-3.1-8b-instant |
+| LLM | Groq (llama-3.1-8b-instant) |
+| UI | egui / eframe |
+| Async runtime | Tokio |
+
+Full architecture writeup — threading model, data flow, and every component in detail — lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Requirements
 
@@ -56,32 +86,23 @@ An intelligent assistant designed to help you during online technical interviews
 
 ## Usage
 
-When the program starts, it will ask you to enter your personal context — one idea per line:
+On launch, a window opens asking for your background — one idea per line, the more specific the better:
 
-```
-Tell us about yourself before starting the interview.
-Write one idea per line. Examples:
-  I work at Caelum as a Full Stack Engineer using Go and React
-  I built a microservices-based ticketing app called Nexus using Go and TypeScript
-  I have experience with hexagonal architecture and DDD
-
-Press Enter twice when you're done.
-```
-
-The more specific your context, the better the responses. Include:
 - Current role and company
 - Projects you've worked on and the technologies used
 - Your main tech stack
 - Architecture patterns you've applied
 
-Once setup is complete, the assistant runs silently in the background. When the interviewer finishes a question, the AI automatically generates a response in the console.
+Press **Start session** to begin. The window switches to a live view: every turn from either side of the call appears as it's transcribed, and the AI's suggested answers show up visually distinguished from the rest of the conversation.
 
 ## Controls
 
-| Key | Action |
+| Control | Action |
 |---|---|
-| `F9` | Pause / resume audio capture |
-| `Ctrl+C` | Shut down |
+| `F9` or **Pause / Resume** button | Pause / resume audio processing |
+| **Hide / Unhide** button | Toggle whether the window is excluded from screen capture |
+| **Close session** button | End the session and close the window |
+| `Ctrl+C` (terminal) | Force shutdown |
 
 ## Output
 
@@ -89,6 +110,14 @@ All conversation turns are saved to `transcript.txt` in the project root:
 
 ```
 [Interviewer]: Tell me about your experience with microservices.
-[AI]: - Built Nexus, a ticket booking platform fully based on microservices using Go and TypeScript...
+[AI]: Built Nexus, a ticket booking platform fully based on microservices using Go and TypeScript...
 [User]: I've worked with microservices in my Nexus project...
 ```
+
+## Roadmap
+
+Ongoing and planned work — observability, reliability fixes, a possible headless RAG service split, local profile persistence, and more — is tracked in [`docs/ARCHITECTURE.md` § Possible Next Steps](docs/ARCHITECTURE.md#18-possible-next-steps).
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
