@@ -22,7 +22,11 @@ pub fn run_window(
     let result = eframe::run_native(
         "AI Interview Copilot",
         options,
-        Box::new(|_| Ok(Box::new(OverlayApp::new(pause_flag, live_transcript, context_tx)))),
+        Box::new(|cc| {
+            cc.egui_ctx.send_viewport_cmd(egui::ViewportCommand::ContentProtected(true));
+
+            Ok(Box::new(OverlayApp::new(pause_flag, live_transcript, context_tx)))
+        }),
     );
 
     if let Err(err) = result {
@@ -36,6 +40,7 @@ struct OverlayApp {
     context:         String,
     context_tx:      Option<oneshot::Sender<String>>,
     started:         bool,
+    is_hidden:       bool,
 }
 
 impl OverlayApp {
@@ -46,6 +51,7 @@ impl OverlayApp {
             context:    String::new(),
             context_tx: Some(context_tx),
             started:    false,
+            is_hidden:  true,
         }
     }
 
@@ -83,7 +89,16 @@ impl eframe::App for OverlayApp {
 
 impl OverlayApp {
     fn show_setup(&mut self, ui: &mut egui::Ui) {
-        ui.label("Escribí el contexto inicial del candidato y presioná Start para comenzar.");
+        ui.horizontal(|ui| {
+            let visibility_label = if self.is_hidden { "Unhide" } else { "Hide" };
+            if ui.button(visibility_label).clicked() {
+                self.is_hidden = !self.is_hidden;
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::ContentProtected(self.is_hidden));
+            }
+        });
+        ui.add_space(8.0);
+
+        ui.label("Enter the candidate's initial context and press Start to begin.");
         ui.add_space(8.0);
 
         egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
@@ -91,7 +106,7 @@ impl OverlayApp {
                 egui::TextEdit::multiline(&mut self.context)
                     .desired_width(f32::INFINITY)
                     .desired_rows(18)
-                    .hint_text("Ejemplo: Trabajo en Caelum como Full Stack Engineer con Go y React"),
+                    .hint_text("Example: Senior Backend Developer with 5 years of experience using Node.js and PostgreSQL"),
             );
         });
 
@@ -106,6 +121,13 @@ impl OverlayApp {
             if ui.button(self.pause_label()).clicked() {
                 self.toggle_pause();
             }
+
+            let visibility_label = if self.is_hidden { "Unhide" } else { "Hide" };
+            if ui.button(visibility_label).clicked() {
+                self.is_hidden = !self.is_hidden;
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::ContentProtected(self.is_hidden));
+            }
+
             if ui.button("Close session").clicked() {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             }
@@ -118,7 +140,7 @@ impl OverlayApp {
         egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
             let lines = self.live_transcript.lock().unwrap();
             if lines.is_empty() {
-                ui.colored_label(egui::Color32::GRAY, "Esperando la conversación...");
+                ui.colored_label(egui::Color32::GRAY, "Waiting for the conversation...");
             } else {
                 for line in lines.iter() {
                     match line.kind {
