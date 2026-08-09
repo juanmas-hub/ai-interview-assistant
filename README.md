@@ -20,6 +20,8 @@ AI Interview Copilot captures your microphone and the interviewer's audio (via s
 
 It's built as a real desktop tool: native Windows audio capture, a local voice-activity-detection model, a resilient streaming transcription pipeline, a session-aware RAG engine, and a native overlay window, running as a multi-threaded Rust application.
 
+> **Intended use.** This project was built for interview practice and self-assessment — rehearsing answers, reviewing your own responses against what the model suggests, and getting comfortable with technical questions before the real thing. Using it to receive undisclosed real-time assistance during an actual interview, without the interviewer's knowledge, may violate the hiring company's policies and, depending on jurisdiction, wiretapping/consent-to-record laws (audio from the call is sent to third-party APIs for transcription). You are responsible for how you use this software; see [`LICENSE`](LICENSE) for the full disclaimer of warranty.
+
 ## Features
 
 - **Real-time dual audio capture** — microphone and system audio captured and transcribed independently and concurrently via WASAPI.
