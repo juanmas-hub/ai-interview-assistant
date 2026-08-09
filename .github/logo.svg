@@ -1,0 +1,20 @@
+<svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+  <rect x="0" y="0" width="200" height="200" rx="40" fill="#1a1b26"/>
+
+  <!-- waveform bars -->
+  <g stroke="#7aa2f7" stroke-width="6" stroke-linecap="round" opacity="0.55">
+    <line x1="38" y1="118" x2="38" y2="150"/>
+    <line x1="54" y1="98"  x2="54" y2="170"/>
+    <line x1="146" y1="98"  x2="146" y2="170"/>
+    <line x1="162" y1="118" x2="162" y2="150"/>
+  </g>
+
+  <!-- microphone -->
+  <rect x="82" y="38" width="36" height="72" rx="18" fill="#7aa2f7"/>
+  <path d="M62 92 a38 38 0 0 0 76 0" fill="none" stroke="#7aa2f7" stroke-width="8" stroke-linecap="round"/>
+  <line x1="100" y1="130" x2="100" y2="154" stroke="#7aa2f7" stroke-width="8" stroke-linecap="round"/>
+  <line x1="78"  y1="154" x2="122" y2="154" stroke="#7aa2f7" stroke-width="8" stroke-linecap="round"/>
+
+  <!-- AI spark accent -->
+  <circle cx="142" cy="52" r="6" fill="#c0caf5"/>
+</svg>
